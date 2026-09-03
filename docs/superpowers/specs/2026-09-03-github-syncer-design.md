@@ -63,8 +63,8 @@ Ten prompts at most, asked in order. Every prompt accepts its default on a bare 
 | 5 | Timezone offset to stamp commits with | the machine's current UTC offset | always |
 | 6 | Destination author name | `git config user.name` | always |
 | 7 | Destination author email | `git config user.email` | always |
-| 8 | Output directory | `./replica` | always |
-| 9 | Commit now, or only write `replay.sh`? | commit now | always |
+| 8 | Commit now, or only write `replay.sh`? | commit now | always |
+| 9 | Output directory | `./replica` | committing now |
 | 10 | Summary, then proceed? | **no** | always |
 
 The cache question comes before the token question because reusing the cache needs no
@@ -90,7 +90,11 @@ validated against real zones only, `±(00-14):(00|15|30|45)`: git accepts `+99:9
 records a commit whose absolute instant is days away from what its local date implies.
 Name, email, and directory reject empty values.
 
-The existing-directory check runs immediately after prompt 8, before the summary, so a
+The directory question is asked only when committing now, because the generated script
+takes no directory: it commits into whatever directory it is run from. Asking for one in
+script mode would be asking for a value that is then ignored.
+
+The existing-directory check runs immediately after prompt 9, before the summary, so a
 run that will be refused is refused before the user confirms it.
 
 ## Fetching the calendar
@@ -238,18 +242,45 @@ looks hung.
 
 ### Script mode
 
-When prompt 8 selects script output, the same commands are written to `replay.sh`
-instead of being executed: a `set -e` header, a `test -e` guard that exits non-zero
-if the output directory exists, the `git init`, one `git commit` line per entry with
-its dates inline, and a closing `echo` reporting the count. The guard matters
-because `git init` on an existing repository succeeds silently, so without it a
-second `bash replay.sh` would double every commit and exit 0.
+When prompt 8 declines to commit now, the same sequence is written to `replay.sh` instead
+of being executed. The script **names no directory anywhere** — no `-C`, no argument to
+`git init`. It commits into whatever directory it is run from, so it can be copied
+somewhere and run there:
 
-The output directory is resolved to an absolute path before rendering, since
-`replay.sh` is written to the current directory but may be run from elsewhere.
+```
+mkdir replica && cd replica && bash ../replay.sh
+```
 
-Values interpolated into `replay.sh` are single-quoted with embedded single quotes
-escaped, without exception.
+It contains, in order: a `set -e` header; a comment saying where the commits will land; an
+`unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE` line, for the same reason `replay()` clears
+them from its child environment — inherited from the calling shell they override the
+working tree and would land every commit in another repository; the doubling guard; then
+one `git commit` line per entry with its dates inline, and a closing `echo` naming the
+count and `$(pwd)`.
+
+The doubling guard replaces the output-directory check, which is meaningless for the
+current directory, and is strictly the better test:
+
+```sh
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  if git rev-parse --verify HEAD >/dev/null 2>&1; then
+    echo '…refusing…' >&2; exit 1
+  fi
+else
+  git init -q -b main
+fi
+```
+
+A directory that already holds commits is either one this script has already run in or
+someone else's work, and appending to either is wrong — `git init` on an existing
+repository succeeds, so without this a second run would silently double the graph and exit
+0. An existing repository with no commits is used as-is; a directory that is not a
+repository is initialised on branch `main`. Running the script anywhere inside an existing
+repository's working tree is therefore refused, which is the desired outcome.
+
+Values interpolated into `replay.sh` are single-quoted with embedded single quotes escaped,
+without exception. With the directory gone, the identity fields are what a quote could
+otherwise break.
 
 ## Failure modes
 
@@ -261,6 +292,7 @@ escaped, without exception.
 | Reversed date range | Throw before any request |
 | Network error mid-fetch | Propagate; `contributions.json` is not written, so nothing is half-cached |
 | Output directory exists | Refuse, exit non-zero, write nothing |
+| `replay.sh` run where commits exist | Script refuses, exits 1, adds nothing |
 | Zero contributions in range | Report and exit before creating any repo |
 | Ctrl-D at any prompt | Abort cleanly with "cancelled, nothing written" |
 | `git` not on PATH | Propagate the `execFileSync` error |
@@ -290,8 +322,11 @@ non-overlapping windows no window holds that date whole, so the partial is all i
 and the test fails; that was verified directly against the previous geometry rather than
 assumed.
 
-The generated script is executed with bash and its author dates compared against the
-direct replay, so the two paths cannot silently diverge. Quoting, the script's guard line,
+The generated script is executed with bash from inside a scratch directory and its author
+dates compared against the direct replay, so the two paths cannot silently diverge. Three
+further tests cover its portability and its guard: that the commits land in the cwd rather
+than any recorded path, that a second run exits non-zero and adds nothing, and that
+running it inside an existing repository leaves that history untouched. Quoting, the script's guard line,
 the existing-directory refusal, the GraphQL error-inside-200 check, the per-window
 integrity warning, and the calendar's zero-day and out-of-range filtering each have their
 own test.

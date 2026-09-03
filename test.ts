@@ -398,60 +398,109 @@ test("replay refuses an existing output directory", () => {
   }
 });
 
-test("the generated script writes the same author dates as a direct replay", () => {
+test("the generated script commits into whatever directory it is run from", () => {
   const base = scratch();
   try {
-    const o: ReplayOpts = {
-      dir: join(base, "from-script"),
-      name: "Me",
-      email: "me@example.com",
-      offset: "+05:00",
-    };
-    const path = join(base, "replay.sh");
-    writeFileSync(path, renderScript(FIXTURE, o));
-    execFileSync("bash", [path], { encoding: "utf8" });
-    const dates = execFileSync("git", ["-C", o.dir, "log", "--reverse", "--format=%aI"], {
+    const script = join(base, "replay.sh");
+    const target = join(base, "somewhere-else");
+    mkdirSync(target);
+    writeFileSync(script, renderScript(FIXTURE, { name: "Me", email: "me@example.com", offset: "+05:00" }));
+    // cwd is the target: the script names no directory, so this is what decides where
+    // the commits land.
+    execFileSync("bash", [script], { cwd: target, encoding: "utf8" });
+    const dates = execFileSync("git", ["-C", target, "log", "--reverse", "--format=%aI"], {
       encoding: "utf8",
     })
       .trim()
       .split("\n");
-    assert.deepEqual(dates, EXPECTED_AT_PLUS_5);
+    assert.deepEqual(dates, EXPECTED_AT_PLUS_5, "same author dates as a direct replay");
+    const branch = execFileSync("git", ["-C", target, "rev-parse", "--abbrev-ref", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    assert.equal(branch, "main");
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
 });
 
+test("running the generated script twice does not double the history", () => {
+  // git init on an existing repo succeeds, so without the HEAD guard a second run would
+  // append a whole second copy and exit 0 — a silently doubled contribution graph.
+  const base = scratch();
+  try {
+    const script = join(base, "replay.sh");
+    const target = join(base, "twice");
+    mkdirSync(target);
+    writeFileSync(script, renderScript(FIXTURE, { name: "Me", email: "me@example.com", offset: "+05:00" }));
+    execFileSync("bash", [script], { cwd: target, encoding: "utf8" });
+    let failed = false;
+    try {
+      execFileSync("bash", [script], { cwd: target, encoding: "utf8", stdio: "pipe" });
+    } catch {
+      failed = true;
+    }
+    assert.ok(failed, "the second run exits non-zero");
+    const count = execFileSync("git", ["-C", target, "rev-list", "--count", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    assert.equal(count, String(FIXTURE.length), "no commits were added by the second run");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("the generated script refuses a directory that is part of an existing repository", () => {
+  const base = scratch();
+  try {
+    const script = join(base, "replay.sh");
+    const repo = join(base, "existing");
+    execFileSync("git", ["init", "-q", "-b", "main", "--", repo]);
+    execFileSync(
+      "git",
+      ["-C", repo, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-q", "-m", "theirs"],
+      { env: { ...process.env, ...commitEnv("Them", "them@example.com", "2020-01-01T00:00:00+00:00") } },
+    );
+    writeFileSync(script, renderScript(FIXTURE, { name: "Me", email: "me@example.com", offset: "+05:00" }));
+    let failed = false;
+    try {
+      execFileSync("bash", [script], { cwd: repo, encoding: "utf8", stdio: "pipe" });
+    } catch {
+      failed = true;
+    }
+    assert.ok(failed, "it refuses rather than committing into someone else's history");
+    const count = execFileSync("git", ["-C", repo, "rev-list", "--count", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    assert.equal(count, "1", "their history is untouched");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("renderScript escapes a single quote in the author identity", () => {
+  // The directory is gone from the script, so the identity is now what a quote can break.
+  const script = renderScript(FIXTURE, { name: "O'Brien", email: "o'b@example.com", offset: "+05:00" });
+  assert.ok(script.includes("'O'\\''Brien'"), "the name's quote is escaped the way shq() escapes it");
+  assert.ok(!script.includes("=O'Brien"), "no unescaped single quote reaches the script");
+  assert.ok(script.includes("'o'\\''b@example.com'"), "the email's quote is escaped too");
+});
+
+test("the generated script names no directory at all", () => {
+  const script = renderScript(FIXTURE, { name: "Me", email: "me@example.com", offset: "+05:00" });
+  assert.ok(!script.includes("git -C "), "no -C flag: the cwd decides where commits land");
+  assert.ok(/^\s*git init -q -b main$/m.test(script), "git init takes no directory either");
+});
+
 test("the generated script unsets the git env vars that would redirect the commits", () => {
-  // GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE in the shell running replay.sh override -C, so
-  // without this the whole replayed history lands in whatever repo they point at.
-  const o: ReplayOpts = { dir: "/tmp/x", name: "Me", email: "me@example.com", offset: "+05:00" };
-  const lines = renderScript(FIXTURE, o).split("\n");
+  // GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE in the shell running replay.sh override the
+  // working tree, so without this the whole replayed history lands elsewhere.
+  const lines = renderScript(FIXTURE, { name: "Me", email: "me@example.com", offset: "+05:00" }).split("\n");
   const unsetIndex = lines.findIndex((l) => l.startsWith("unset "));
   assert.ok(unsetIndex !== -1, "an unset line exists");
   for (const v of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]) {
     assert.ok(lines[unsetIndex].includes(v), `${v} is unset`);
   }
   assert.ok(unsetIndex < lines.findIndex((l) => l.includes("git init")), "it runs before git init");
-});
-
-test("renderScript escapes a single quote in the output directory path everywhere it appears", () => {
-  const o: ReplayOpts = { dir: "/tmp/it's here", name: "Me", email: "me@example.com", offset: "+05:00" };
-  const script = renderScript(FIXTURE, o);
-  assert.ok(script.includes("it'\\''s"), "the quote in the path is escaped the way shq() escapes it");
-  assert.ok(!script.includes("it's here"), "no unescaped single quote reaches the script");
-});
-
-test("renderScript's guard line refuses an existing output directory before git init runs", () => {
-  const o: ReplayOpts = { dir: "/tmp/it's here", name: "Me", email: "me@example.com", offset: "+05:00" };
-  const script = renderScript(FIXTURE, o);
-  const lines = script.split("\n");
-  const guardIndex = lines.findIndex((l) => l.startsWith("test -e "));
-  const initIndex = lines.findIndex((l) => l.includes("git init"));
-  assert.ok(guardIndex !== -1, "a guard line exists");
-  assert.ok(guardIndex < initIndex, "the guard runs before git init");
-  assert.ok(lines[guardIndex].includes(shq(o.dir)), "the guarded path went through shq");
-  assert.ok(lines[guardIndex].includes("exit 1"), "the guard exits non-zero on a match");
-  assert.ok(!lines[guardIndex].includes("it's here"), "no unescaped single quote reaches the guard line");
 });
 
 test("importing the module does not start the interactive flow", async () => {

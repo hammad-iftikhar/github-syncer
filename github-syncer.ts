@@ -2,7 +2,6 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface, type Interface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import { resolve } from "node:path";
 
 export function toOffset(utcIso: string, offset: string): string {
   const minutes = offsetMinutes(offset);
@@ -228,11 +227,16 @@ export function synthesize(days: Day[], offset: string): Entry[] {
   return out;
 }
 
-export interface ReplayOpts {
-  dir: string;
+/** Who the replayed commits are attributed to, and the zone their timestamps carry. */
+export interface Identity {
   name: string;
   email: string;
   offset: string;
+}
+
+/** An identity plus the directory replay() builds in. The script needs no directory. */
+export interface ReplayOpts extends Identity {
+  dir: string;
 }
 
 export function shq(s: string): string {
@@ -275,15 +279,28 @@ export function replay(entries: Entry[], o: ReplayOpts): void {
   }
 }
 
-export function renderScript(entries: Entry[], o: ReplayOpts): string {
+export function renderScript(entries: Entry[], o: Identity): string {
   const lines = [
     "#!/usr/bin/env bash",
     "set -e",
-    // Same reason replay() clears these: inherited from the caller they override -C and
-    // would land every commit below in another repository.
+    "",
+    "# Commits land in whichever directory this script is run from. Copy it into an empty",
+    "# directory and run it there.",
+    "",
+    // Inherited from the calling shell these override the working tree and would land
+    // every commit below in another repository.
     "unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE",
-    `test -e ${shq(o.dir)} && { echo ${shq(`${o.dir} already exists — refusing to append to it`)} >&2; exit 1; }`,
-    `git init -q -b main -- ${shq(o.dir)}`,
+    "",
+    // The doubling guard. A directory that already has commits is either a repo this
+    // script already ran in or someone else's work; either way appending is wrong.
+    'if git rev-parse --git-dir >/dev/null 2>&1; then',
+    '  if git rev-parse --verify HEAD >/dev/null 2>&1; then',
+    `    echo ${shq("this directory already has commits — refusing to append to it")} >&2`,
+    "    exit 1",
+    "  fi",
+    "else",
+    "  git init -q -b main",
+    "fi",
     "",
   ];
   for (const e of entries) {
@@ -291,10 +308,11 @@ export function renderScript(entries: Entry[], o: ReplayOpts): string {
     lines.push(
       `GIT_AUTHOR_NAME=${shq(o.name)} GIT_AUTHOR_EMAIL=${shq(o.email)} GIT_AUTHOR_DATE=${shq(date)} \\`,
       `GIT_COMMITTER_NAME=${shq(o.name)} GIT_COMMITTER_EMAIL=${shq(o.email)} GIT_COMMITTER_DATE=${shq(date)} \\`,
-      `  git -C ${shq(o.dir)} -c commit.gpgsign=false -c core.hooksPath=/dev/null commit --allow-empty -q -m ${shq(`contribution ${e.id}`)}`,
+      `  git -c commit.gpgsign=false -c core.hooksPath=/dev/null commit --allow-empty -q -m ${shq(`contribution ${e.id}`)}`,
     );
   }
-  lines.push("", `echo ${shq(`created ${entries.length} commits in ${o.dir}`)}`, "");
+  const plural = entries.length === 1 ? "commit" : "commits";
+  lines.push("", `echo ${shq(`created ${entries.length} ${plural} in`)} "$(pwd)"`, "");
   return lines.join("\n");
 }
 
@@ -458,14 +476,17 @@ async function main(): Promise<void> {
     console.log("  note: this email must be a VERIFIED email on the destination account,");
     console.log("  or GitHub will attribute the commits to nobody and the graph stays empty.");
     const email = await askRequired(rl, "Destination author email", gitConfig("user.email"), signal);
-    const dir = await askRequired(rl, "Output directory", "./replica", signal);
-    // Checked here — before the summary — rather than only inside replay(), so a user
-    // in script mode (which has no directory-exists check of its own) is not asked to
-    // confirm a run that is refused right after. See replay()'s own check for its contract.
-    if (existsSync(dir)) throw new Error(`${dir} already exists — refusing to append to it`);
     const commitNow = await askYes(rl, "Commit now? (n = only write replay.sh)", true, signal);
+    // Only the in-process replay needs a destination: the script commits wherever it is run.
+    let dir = "";
+    if (commitNow) {
+      dir = await askRequired(rl, "Output directory", "./replica", signal);
+      // Checked before the summary rather than only inside replay(), so the user is not
+      // asked to confirm a run that is refused right afterwards.
+      if (existsSync(dir)) throw new Error(`${dir} already exists — refusing to append to it`);
+    }
 
-    const opts: ReplayOpts = { dir, name, email, offset };
+    const identity: Identity = { name, email, offset };
     const entries = synthesize(days, offset);
     const busiest = days.reduce((a, b) => (b.count > a.count ? b : a));
     console.log("\n--- summary ---");
@@ -474,7 +495,7 @@ async function main(): Promise<void> {
     console.log(`range:         ${days[0].date} .. ${days.at(-1)!.date}`);
     console.log(`busiest day:   ${busiest.date} (${busiest.count})`);
     console.log(`identity:      ${name} <${email}>`);
-    console.log(`target:        ${dir}${commitNow ? "" : "  (via replay.sh)"}`);
+    console.log(`target:        ${commitNow ? dir : "wherever you run replay.sh"}`);
     console.log("---------------\n");
     if (!(await askYes(rl, "Proceed?", false, signal))) {
       console.log("aborted, nothing written");
@@ -482,14 +503,12 @@ async function main(): Promise<void> {
     }
 
     if (commitNow) {
-      replay(entries, opts);
+      replay(entries, { ...identity, dir });
       console.log(`\ncreated ${entries.length} commits in ${dir}`);
     } else {
-      // replay.sh is always written to the cwd, but `dir` may be relative — resolve it
-      // now so the script builds the replica in the right place even if `bash replay.sh`
-      // is later run from a different directory.
-      writeFileSync("replay.sh", renderScript(entries, { ...opts, dir: resolve(dir) }));
-      console.log(`\nwrote replay.sh — review it, then: bash replay.sh`);
+      writeFileSync("replay.sh", renderScript(entries, identity));
+      console.log(`\nwrote replay.sh — review it, then run it inside an empty directory:`);
+      console.log("  mkdir replica && cd replica && bash ../replay.sh");
       return;
     }
 

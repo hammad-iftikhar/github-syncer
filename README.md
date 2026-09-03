@@ -27,6 +27,14 @@ At the end you choose whether to commit the replica immediately or write a
 `replay.sh` script to run later — review it first, since it contains the full
 replayed history as shell commands.
 
+`replay.sh` names no directory: it commits into whatever directory you run it
+from, so you can move it anywhere.
+
+    mkdir replica && cd replica && bash ../replay.sh
+
+It refuses to run in a directory that already has commits, so a second run can't
+double your graph, and it won't commit into an existing repository's history.
+
 If a previous run's `contributions.json` is present, you're offered a chance to
 reuse it (with its total and date range shown) instead of re-hitting the API.
 
