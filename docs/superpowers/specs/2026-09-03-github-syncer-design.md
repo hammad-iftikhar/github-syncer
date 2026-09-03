@@ -258,25 +258,20 @@ working tree and would land every commit in another repository; the doubling gua
 one `git commit` line per entry with its dates inline, and a closing `echo` naming the
 count and `$(pwd)`.
 
-The doubling guard replaces the output-directory check, which is meaningless for the
-current directory, and is strictly the better test:
+The script initialises only when needed:
 
 ```sh
-if git rev-parse --git-dir >/dev/null 2>&1; then
-  if git rev-parse --verify HEAD >/dev/null 2>&1; then
-    echo '…refusing…' >&2; exit 1
-  fi
-else
-  git init -q -b main
-fi
+git rev-parse --git-dir >/dev/null 2>&1 || git init -q -b main
 ```
 
-A directory that already holds commits is either one this script has already run in or
-someone else's work, and appending to either is wrong — `git init` on an existing
-repository succeeds, so without this a second run would silently double the graph and exit
-0. An existing repository with no commits is used as-is; a directory that is not a
-repository is initialised on branch `main`. Running the script anywhere inside an existing
-repository's working tree is therefore refused, which is the desired outcome.
+so it runs equally in an empty directory and in a repository the user already created,
+appending in the latter case. It does **not** refuse a directory that already holds
+commits. An earlier revision did, on the grounds that `git init` on an existing repository
+succeeds and so a second run would silently double the graph and exit 0. That protection
+was removed at the user's explicit request, because it also blocked the legitimate case of
+replaying into a repository created ahead of time. The consequence is stated in the
+script's own header comment and in the README: running it twice gives two copies of the
+history. The in-process `replay()` path keeps its own existing-directory refusal.
 
 Values interpolated into `replay.sh` are single-quoted with embedded single quotes escaped,
 without exception. With the directory gone, the identity fields are what a quote could
@@ -292,7 +287,7 @@ otherwise break.
 | Reversed date range | Throw before any request |
 | Network error mid-fetch | Propagate; `contributions.json` is not written, so nothing is half-cached |
 | Output directory exists | Refuse, exit non-zero, write nothing |
-| `replay.sh` run where commits exist | Script refuses, exits 1, adds nothing |
+| `replay.sh` run where commits exist | Appends to that history; re-running duplicates it |
 | Zero contributions in range | Report and exit before creating any repo |
 | Ctrl-D at any prompt | Abort cleanly with "cancelled, nothing written" |
 | `git` not on PATH | Propagate the `execFileSync` error |
@@ -323,10 +318,10 @@ and the test fails; that was verified directly against the previous geometry rat
 assumed.
 
 The generated script is executed with bash from inside a scratch directory and its author
-dates compared against the direct replay, so the two paths cannot silently diverge. Three
-further tests cover its portability and its guard: that the commits land in the cwd rather
-than any recorded path, that a second run exits non-zero and adds nothing, and that
-running it inside an existing repository leaves that history untouched. Quoting, the script's guard line,
+dates compared against the direct replay, so the two paths cannot silently diverge. Two
+further tests cover its portability: that the commits land in the cwd rather than any
+recorded path, and that running it inside a repository that already has commits keeps that
+history and appends on top. Quoting, the script's guard line,
 the existing-directory refusal, the GraphQL error-inside-200 check, the per-window
 integrity warning, and the calendar's zero-day and out-of-range filtering each have their
 own test.

@@ -423,33 +423,9 @@ test("the generated script commits into whatever directory it is run from", () =
   }
 });
 
-test("running the generated script twice does not double the history", () => {
-  // git init on an existing repo succeeds, so without the HEAD guard a second run would
-  // append a whole second copy and exit 0 — a silently doubled contribution graph.
-  const base = scratch();
-  try {
-    const script = join(base, "replay.sh");
-    const target = join(base, "twice");
-    mkdirSync(target);
-    writeFileSync(script, renderScript(FIXTURE, { name: "Me", email: "me@example.com", offset: "+05:00" }));
-    execFileSync("bash", [script], { cwd: target, encoding: "utf8" });
-    let failed = false;
-    try {
-      execFileSync("bash", [script], { cwd: target, encoding: "utf8", stdio: "pipe" });
-    } catch {
-      failed = true;
-    }
-    assert.ok(failed, "the second run exits non-zero");
-    const count = execFileSync("git", ["-C", target, "rev-list", "--count", "HEAD"], {
-      encoding: "utf8",
-    }).trim();
-    assert.equal(count, String(FIXTURE.length), "no commits were added by the second run");
-  } finally {
-    rmSync(base, { recursive: true, force: true });
-  }
-});
-
-test("the generated script refuses a directory that is part of an existing repository", () => {
+test("the generated script appends to a repository that already has commits", () => {
+  // No emptiness check: the script initialises only when needed, so it can be run inside
+  // a repo you already created. The existing history is kept and the replay lands on top.
   const base = scratch();
   try {
     const script = join(base, "replay.sh");
@@ -457,21 +433,19 @@ test("the generated script refuses a directory that is part of an existing repos
     execFileSync("git", ["init", "-q", "-b", "main", "--", repo]);
     execFileSync(
       "git",
-      ["-C", repo, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-q", "-m", "theirs"],
-      { env: { ...process.env, ...commitEnv("Them", "them@example.com", "2020-01-01T00:00:00+00:00") } },
+      ["-C", repo, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-q", "-m", "mine"],
+      { env: { ...process.env, ...commitEnv("Me", "me@example.com", "2020-01-01T00:00:00+00:00") } },
     );
     writeFileSync(script, renderScript(FIXTURE, { name: "Me", email: "me@example.com", offset: "+05:00" }));
-    let failed = false;
-    try {
-      execFileSync("bash", [script], { cwd: repo, encoding: "utf8", stdio: "pipe" });
-    } catch {
-      failed = true;
-    }
-    assert.ok(failed, "it refuses rather than committing into someone else's history");
-    const count = execFileSync("git", ["-C", repo, "rev-list", "--count", "HEAD"], {
+    execFileSync("bash", [script], { cwd: repo, encoding: "utf8" });
+    const subjects = execFileSync("git", ["-C", repo, "log", "--reverse", "--format=%s"], {
       encoding: "utf8",
-    }).trim();
-    assert.equal(count, "1", "their history is untouched");
+    })
+      .trim()
+      .split("\n");
+    assert.equal(subjects.length, FIXTURE.length + 1);
+    assert.equal(subjects[0], "mine", "the pre-existing commit is still there, still first");
+    assert.equal(subjects[1], "contribution 2024-03-11#1");
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -488,7 +462,8 @@ test("renderScript escapes a single quote in the author identity", () => {
 test("the generated script names no directory at all", () => {
   const script = renderScript(FIXTURE, { name: "Me", email: "me@example.com", offset: "+05:00" });
   assert.ok(!script.includes("git -C "), "no -C flag: the cwd decides where commits land");
-  assert.ok(/^\s*git init -q -b main$/m.test(script), "git init takes no directory either");
+  assert.ok(/git init -q -b main$/m.test(script), "git init takes no directory either");
+  assert.ok(script.includes("git rev-parse --git-dir"), "it initialises only when needed");
 });
 
 test("the generated script unsets the git env vars that would redirect the commits", () => {

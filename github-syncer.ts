@@ -284,23 +284,17 @@ export function renderScript(entries: Entry[], o: Identity): string {
     "#!/usr/bin/env bash",
     "set -e",
     "",
-    "# Commits land in whichever directory this script is run from. Copy it into an empty",
-    "# directory and run it there.",
+    "# Commits land in whichever directory this script is run from. Run it once: it appends,",
+    "# so running it twice gives you two copies of the history.",
     "",
     // Inherited from the calling shell these override the working tree and would land
     // every commit below in another repository.
     "unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE",
     "",
-    // The doubling guard. A directory that already has commits is either a repo this
-    // script already ran in or someone else's work; either way appending is wrong.
-    'if git rev-parse --git-dir >/dev/null 2>&1; then',
-    '  if git rev-parse --verify HEAD >/dev/null 2>&1; then',
-    `    echo ${shq("this directory already has commits — refusing to append to it")} >&2`,
-    "    exit 1",
-    "  fi",
-    "else",
-    "  git init -q -b main",
-    "fi",
+    // Initialise only if this is not already a repository, so the script can equally be
+    // run in an empty directory or in a repo you already created. It does not refuse a
+    // directory that has commits: re-running it appends a second copy of the history.
+    "git rev-parse --git-dir >/dev/null 2>&1 || git init -q -b main",
     "",
   ];
   for (const e of entries) {

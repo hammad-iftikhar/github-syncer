@@ -32,8 +32,10 @@ from, so you can move it anywhere.
 
     mkdir replica && cd replica && bash ../replay.sh
 
-It refuses to run in a directory that already has commits, so a second run can't
-double your graph, and it won't commit into an existing repository's history.
+It creates a repo if the directory isn't one already, and otherwise appends to
+what's there — so you can also run it inside a repo you already made. **Run it
+once:** it has no re-run protection, so running it twice gives you two copies of
+the history.
 
 If a previous run's `contributions.json` is present, you're offered a chance to
 reuse it (with its total and date range shown) instead of re-hitting the API.
