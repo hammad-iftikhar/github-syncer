@@ -291,3 +291,10 @@ test("renderScript escapes a single quote in the output directory path everywher
   assert.ok(script.includes("it'\\''s"), "the quote in the path is escaped the way shq() escapes it");
   assert.ok(!script.includes("it's here"), "no unescaped single quote reaches the script");
 });
+
+test("importing the module does not start the interactive flow", async () => {
+  // If main() ran on import, this test file would already have blocked on a prompt.
+  const mod = await import("./github-syncer.ts");
+  assert.equal(typeof mod.collectCommits, "function");
+  assert.equal("main" in mod, false, "main stays module-private");
+});

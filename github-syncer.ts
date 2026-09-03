@@ -1,5 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createInterface, type Interface } from "node:readline/promises";
+import { stdin, stdout } from "node:process";
 
 export function toOffset(utcIso: string, offset: string): string {
   const m = /^([+-])(\d{2}):(\d{2})$/.exec(offset);
@@ -208,3 +210,138 @@ export function renderScript(commits: Commit[], o: ReplayOpts): string {
   lines.push("", `echo ${shq(`created ${commits.length} commits in ${o.dir}`)}`, "");
   return lines.join("\n");
 }
+
+const CACHE = "commits.json";
+
+function gitConfig(key: string): string {
+  try {
+    return execFileSync("git", ["config", "--get", key], { encoding: "utf8" }).trim();
+  } catch {
+    return "";
+  }
+}
+
+function isoDaysAgo(days: number): string {
+  return new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
+}
+
+async function ask(rl: Interface, q: string, def = ""): Promise<string> {
+  const answer = (await rl.question(def ? `${q} [${def}]: ` : `${q}: `)).trim();
+  return answer || def;
+}
+
+async function askValid(rl: Interface, q: string, def: string, ok: (s: string) => boolean): Promise<string> {
+  for (;;) {
+    const a = await ask(rl, q, def);
+    if (ok(a)) return a;
+    console.log("  invalid, try again");
+  }
+}
+
+async function askRequired(rl: Interface, q: string, def: string): Promise<string> {
+  for (;;) {
+    const a = await ask(rl, q, def);
+    if (a) return a;
+    console.log("  required");
+  }
+}
+
+async function askYes(rl: Interface, q: string, defYes: boolean): Promise<boolean> {
+  const a = (await ask(rl, `${q} (y/n)`, defYes ? "y" : "n")).toLowerCase();
+  return a.startsWith("y");
+}
+
+async function askSecret(rl: Interface, q: string): Promise<string> {
+  // ponytail: _writeToOutput is a private readline field. It is the only way to mute
+  // echo without a dependency; if a Node upgrade breaks it, the fallback is to require
+  // GITHUB_TOKEN in the environment and drop this prompt.
+  const iface = rl as unknown as { _writeToOutput?: (s: string) => void };
+  const original = iface._writeToOutput;
+  stdout.write(`${q}: `);
+  iface._writeToOutput = () => {};
+  try {
+    const value = (await rl.question("")).trim();
+    stdout.write("\n");
+    return value;
+  } finally {
+    iface._writeToOutput = original;
+  }
+}
+
+async function main(): Promise<void> {
+  const rl = createInterface({ input: stdin, output: stdout, terminal: true });
+  try {
+    console.log("github-syncer — replicate one account's commit history as empty commits\n");
+
+    const token = process.env.GITHUB_TOKEN || (await askSecret(rl, "Source GitHub token"));
+    if (!token) throw new Error("a token is required");
+
+    let commits: Commit[] | null = null;
+    if (existsSync(CACHE)) {
+      const cached = JSON.parse(readFileSync(CACHE, "utf8")) as Commit[];
+      const when = statSync(CACHE).mtime.toISOString().slice(0, 16).replace("T", " ");
+      if (await askYes(rl, `Reuse ${CACHE} (${cached.length} commits, fetched ${when})?`, true)) {
+        commits = cached;
+      }
+    }
+
+    if (!commits) {
+      const since = await askValid(rl, "Since date (YYYY-MM-DD)", isoDaysAgo(365), isDate);
+      const until = await askValid(rl, "Until date (YYYY-MM-DD)", isoDaysAgo(0), isDate);
+      console.log("\nfetching...");
+      commits = await collectCommits(token, since, until);
+      writeFileSync(CACHE, `${JSON.stringify(commits, null, 2)}\n`);
+      console.log(`\ncached ${commits.length} commits to ${CACHE}`);
+    }
+
+    if (commits.length === 0) {
+      console.log("no commits in that range — nothing to do");
+      return;
+    }
+
+    const offset = await askValid(
+      rl,
+      "Replay timezone offset (the zone you did the work in)",
+      localOffset(),
+      isOffset,
+    );
+    const name = await askRequired(rl, "Destination author name", gitConfig("user.name"));
+    console.log("  note: this email must be a VERIFIED email on the destination account,");
+    console.log("  or GitHub will attribute the commits to nobody and the graph stays empty.");
+    const email = await askRequired(rl, "Destination author email", gitConfig("user.email"));
+    const dir = await askRequired(rl, "Output directory", "./replica");
+    const commitNow = await askYes(rl, "Commit now? (n = only write replay.sh)", true);
+
+    const opts: ReplayOpts = { dir, name, email, offset };
+    console.log("\n--- summary ---");
+    console.log(`commits:  ${commits.length}`);
+    console.log(`range:    ${toOffset(commits[0].date, offset)} .. ${toOffset(commits.at(-1)!.date, offset)}`);
+    console.log(`identity: ${name} <${email}>`);
+    console.log(`target:   ${dir}${commitNow ? "" : "  (via replay.sh)"}`);
+    console.log("---------------\n");
+    if (!(await askYes(rl, "Proceed?", false))) {
+      console.log("aborted, nothing written");
+      return;
+    }
+
+    if (commitNow) {
+      replay(commits, opts);
+      console.log(`\ncreated ${commits.length} commits in ${dir}`);
+    } else {
+      writeFileSync("replay.sh", renderScript(commits, opts));
+      console.log(`\nwrote replay.sh — review it, then: bash replay.sh`);
+      return;
+    }
+
+    console.log("\npush it:");
+    console.log(`  cd ${dir}`);
+    console.log("  git remote add origin git@github.com:<you>/<repo>.git");
+    console.log("  git push -u origin main");
+  } finally {
+    rl.close();
+  }
+}
+
+// ponytail: argv[1] comparison is the entry guard. Good enough for `node github-syncer.ts`;
+// a symlinked bin wrapper would need realpath here.
+if (import.meta.filename === process.argv[1]) await main();
