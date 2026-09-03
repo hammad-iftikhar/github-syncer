@@ -55,7 +55,9 @@ destination account, or GitHub attributes the commits to no one and the
 contribution graph stays empty.
 
 Prompt 9 prints the commit count, the earliest and latest commit dates, the
-destination identity, and the output path before anything is written to disk.
+destination identity, and the output path before the output directory or
+`replay.sh` is written. `commits.json` is the exception: it is deliberately
+written earlier, as a cache, so an aborted run does not have to re-fetch.
 It is the only prompt that defaults to no.
 
 Dates from prompts 2 and 3 are validated as `YYYY-MM-DD` and re-asked on bad

@@ -225,33 +225,39 @@ function isoDaysAgo(days: number): string {
   return new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
 }
 
-async function ask(rl: Interface, q: string, def = ""): Promise<string> {
-  const answer = (await rl.question(def ? `${q} [${def}]: ` : `${q}: `)).trim();
+async function ask(rl: Interface, q: string, signal: AbortSignal, def = ""): Promise<string> {
+  const answer = (await rl.question(def ? `${q} [${def}]: ` : `${q}: `, { signal })).trim();
   return answer || def;
 }
 
-async function askValid(rl: Interface, q: string, def: string, ok: (s: string) => boolean): Promise<string> {
+async function askValid(
+  rl: Interface,
+  q: string,
+  def: string,
+  ok: (s: string) => boolean,
+  signal: AbortSignal,
+): Promise<string> {
   for (;;) {
-    const a = await ask(rl, q, def);
+    const a = await ask(rl, q, signal, def);
     if (ok(a)) return a;
     console.log("  invalid, try again");
   }
 }
 
-async function askRequired(rl: Interface, q: string, def: string): Promise<string> {
+async function askRequired(rl: Interface, q: string, def: string, signal: AbortSignal): Promise<string> {
   for (;;) {
-    const a = await ask(rl, q, def);
+    const a = await ask(rl, q, signal, def);
     if (a) return a;
     console.log("  required");
   }
 }
 
-async function askYes(rl: Interface, q: string, defYes: boolean): Promise<boolean> {
-  const a = (await ask(rl, `${q} (y/n)`, defYes ? "y" : "n")).toLowerCase();
+async function askYes(rl: Interface, q: string, defYes: boolean, signal: AbortSignal): Promise<boolean> {
+  const a = (await ask(rl, `${q} (y/n)`, signal, defYes ? "y" : "n")).toLowerCase();
   return a.startsWith("y");
 }
 
-async function askSecret(rl: Interface, q: string): Promise<string> {
+async function askSecret(rl: Interface, q: string, signal: AbortSignal): Promise<string> {
   // ponytail: _writeToOutput is a private readline field. It is the only way to mute
   // echo without a dependency; if a Node upgrade breaks it, the fallback is to require
   // GITHUB_TOKEN in the environment and drop this prompt.
@@ -260,7 +266,7 @@ async function askSecret(rl: Interface, q: string): Promise<string> {
   stdout.write(`${q}: `);
   iface._writeToOutput = () => {};
   try {
-    const value = (await rl.question("")).trim();
+    const value = (await rl.question("", { signal })).trim();
     stdout.write("\n");
     return value;
   } finally {
@@ -270,24 +276,30 @@ async function askSecret(rl: Interface, q: string): Promise<string> {
 
 async function main(): Promise<void> {
   const rl = createInterface({ input: stdin, output: stdout, terminal: true });
+  // ponytail: one AbortController, aborted on the interface's own "close" event —
+  // the same event a real Ctrl-D on a TTY fires. Every rl.question() gets the
+  // signal so a mid-prompt Ctrl-D rejects cleanly instead of hanging forever.
+  const ac = new AbortController();
+  rl.once("close", () => ac.abort());
+  const { signal } = ac;
   try {
     console.log("github-syncer — replicate one account's commit history as empty commits\n");
 
-    const token = process.env.GITHUB_TOKEN || (await askSecret(rl, "Source GitHub token"));
+    const token = process.env.GITHUB_TOKEN || (await askSecret(rl, "Source GitHub token", signal));
     if (!token) throw new Error("a token is required");
 
     let commits: Commit[] | null = null;
     if (existsSync(CACHE)) {
       const cached = JSON.parse(readFileSync(CACHE, "utf8")) as Commit[];
       const when = statSync(CACHE).mtime.toISOString().slice(0, 16).replace("T", " ");
-      if (await askYes(rl, `Reuse ${CACHE} (${cached.length} commits, fetched ${when})?`, true)) {
+      if (await askYes(rl, `Reuse ${CACHE} (${cached.length} commits, fetched ${when})?`, true, signal)) {
         commits = cached;
       }
     }
 
     if (!commits) {
-      const since = await askValid(rl, "Since date (YYYY-MM-DD)", isoDaysAgo(365), isDate);
-      const until = await askValid(rl, "Until date (YYYY-MM-DD)", isoDaysAgo(0), isDate);
+      const since = await askValid(rl, "Since date (YYYY-MM-DD)", isoDaysAgo(365), isDate, signal);
+      const until = await askValid(rl, "Until date (YYYY-MM-DD)", isoDaysAgo(0), isDate, signal);
       console.log("\nfetching...");
       commits = await collectCommits(token, since, until);
       writeFileSync(CACHE, `${JSON.stringify(commits, null, 2)}\n`);
@@ -304,13 +316,14 @@ async function main(): Promise<void> {
       "Replay timezone offset (the zone you did the work in)",
       localOffset(),
       isOffset,
+      signal,
     );
-    const name = await askRequired(rl, "Destination author name", gitConfig("user.name"));
+    const name = await askRequired(rl, "Destination author name", gitConfig("user.name"), signal);
     console.log("  note: this email must be a VERIFIED email on the destination account,");
     console.log("  or GitHub will attribute the commits to nobody and the graph stays empty.");
-    const email = await askRequired(rl, "Destination author email", gitConfig("user.email"));
-    const dir = await askRequired(rl, "Output directory", "./replica");
-    const commitNow = await askYes(rl, "Commit now? (n = only write replay.sh)", true);
+    const email = await askRequired(rl, "Destination author email", gitConfig("user.email"), signal);
+    const dir = await askRequired(rl, "Output directory", "./replica", signal);
+    const commitNow = await askYes(rl, "Commit now? (n = only write replay.sh)", true, signal);
 
     const opts: ReplayOpts = { dir, name, email, offset };
     console.log("\n--- summary ---");
@@ -319,7 +332,7 @@ async function main(): Promise<void> {
     console.log(`identity: ${name} <${email}>`);
     console.log(`target:   ${dir}${commitNow ? "" : "  (via replay.sh)"}`);
     console.log("---------------\n");
-    if (!(await askYes(rl, "Proceed?", false))) {
+    if (!(await askYes(rl, "Proceed?", false, signal))) {
       console.log("aborted, nothing written");
       return;
     }
@@ -337,6 +350,12 @@ async function main(): Promise<void> {
     console.log(`  cd ${dir}`);
     console.log("  git remote add origin git@github.com:<you>/<repo>.git");
     console.log("  git push -u origin main");
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      console.log("\ncancelled, nothing written");
+      return;
+    }
+    throw err;
   } finally {
     rl.close();
   }
