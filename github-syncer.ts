@@ -1,3 +1,6 @@
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+
 export function toOffset(utcIso: string, offset: string): string {
   const m = /^([+-])(\d{2}):(\d{2})$/.exec(offset);
   if (!m) throw new Error(`bad offset: ${offset}`);
@@ -145,4 +148,60 @@ export async function collectCommits(
     console.log(`  [${i + 1}/${live.length}] ${repo.full_name}: ${commits.length}`);
   }
   return dedupeSort(out);
+}
+
+export interface ReplayOpts {
+  dir: string;
+  name: string;
+  email: string;
+  offset: string;
+}
+
+export function shq(s: string): string {
+  return `'${s.replaceAll("'", "'\\''")}'`;
+}
+
+export function commitEnv(name: string, email: string, date: string): Record<string, string> {
+  return {
+    GIT_AUTHOR_NAME: name,
+    GIT_AUTHOR_EMAIL: email,
+    GIT_AUTHOR_DATE: date,
+    GIT_COMMITTER_NAME: name,
+    GIT_COMMITTER_EMAIL: email,
+    GIT_COMMITTER_DATE: date,
+  };
+}
+
+export function replay(commits: Commit[], o: ReplayOpts): void {
+  if (existsSync(o.dir)) throw new Error(`${o.dir} already exists — refusing to append to it`);
+  execFileSync("git", ["init", "-q", "-b", "main", o.dir]);
+  let n = 0;
+  for (const c of commits) {
+    const date = toOffset(c.date, o.offset);
+    execFileSync(
+      "git",
+      ["-C", o.dir, "commit", "--allow-empty", "-q", "-m", `sync ${c.sha.slice(0, 7)}`],
+      { env: { ...process.env, ...commitEnv(o.name, o.email, date) } },
+    );
+    if (++n % 100 === 0) console.log(`  ${n}/${commits.length} commits`);
+  }
+}
+
+export function renderScript(commits: Commit[], o: ReplayOpts): string {
+  const lines = [
+    "#!/usr/bin/env bash",
+    "set -e",
+    `git init -q -b main ${shq(o.dir)}`,
+    "",
+  ];
+  for (const c of commits) {
+    const date = toOffset(c.date, o.offset);
+    lines.push(
+      `GIT_AUTHOR_NAME=${shq(o.name)} GIT_AUTHOR_EMAIL=${shq(o.email)} GIT_AUTHOR_DATE=${shq(date)} \\`,
+      `GIT_COMMITTER_NAME=${shq(o.name)} GIT_COMMITTER_EMAIL=${shq(o.email)} GIT_COMMITTER_DATE=${shq(date)} \\`,
+      `  git -C ${shq(o.dir)} commit --allow-empty -q -m ${shq(`sync ${c.sha.slice(0, 7)}`)}`,
+    );
+  }
+  lines.push("", `echo 'created ${commits.length} commits in ${o.dir}'`, "");
+  return lines.join("\n");
 }

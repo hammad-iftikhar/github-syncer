@@ -197,3 +197,90 @@ test("collectCommits skips commits with no author date", async () => {
   };
   assert.deepEqual(await collectCommits("t", "2024-01-01", "2024-12-31", f), []);
 });
+
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { replay, renderScript, shq, commitEnv, type ReplayOpts } from "./github-syncer.ts";
+
+const FIXTURE: Commit[] = [
+  { sha: "aaaaaaa1111", repo: "me/one", date: "2024-03-11T09:22:07Z" },
+  { sha: "bbbbbbb2222", repo: "me/two", date: "2024-06-02T18:45:00Z" },
+  { sha: "ccccccc3333", repo: "me/two", date: "2025-01-15T04:05:06Z" },
+];
+
+const EXPECTED_AT_PLUS_5 = [
+  "2024-03-11T14:22:07+05:00",
+  "2024-06-02T23:45:00+05:00",
+  "2025-01-15T09:05:06+05:00",
+];
+
+function scratch(): string {
+  return mkdtempSync(join(tmpdir(), "gh-syncer-"));
+}
+
+test("shq single-quotes and escapes embedded quotes", () => {
+  assert.equal(shq("plain"), "'plain'");
+  assert.equal(shq("O'Brien"), "'O'\\''Brien'");
+});
+
+test("commitEnv sets author and committer to the same identity and date", () => {
+  const e = commitEnv("Me", "me@example.com", "2024-03-11T14:22:07+05:00");
+  assert.equal(e.GIT_AUTHOR_DATE, e.GIT_COMMITTER_DATE);
+  assert.equal(e.GIT_AUTHOR_EMAIL, "me@example.com");
+  assert.equal(e.GIT_COMMITTER_NAME, "Me");
+});
+
+test("replay writes commits whose author dates match the converted timestamps exactly", () => {
+  const base = scratch();
+  try {
+    const dir = join(base, "replica");
+    replay(FIXTURE, { dir, name: "Me", email: "me@example.com", offset: "+05:00" });
+    const log = execFileSync("git", ["-C", dir, "log", "--reverse", "--format=%aI|%cI|%an|%ae|%s"], {
+      encoding: "utf8",
+    }).trim().split("\n");
+    assert.equal(log.length, 3);
+    assert.deepEqual(log.map((l) => l.split("|")[0]), EXPECTED_AT_PLUS_5);
+    assert.deepEqual(log.map((l) => l.split("|")[1]), EXPECTED_AT_PLUS_5, "committer dates match author dates");
+    assert.equal(log[0].split("|")[3], "me@example.com");
+    assert.equal(log[0].split("|")[4], "sync aaaaaaa");
+    const branch = execFileSync("git", ["-C", dir, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" }).trim();
+    assert.equal(branch, "main");
+    const tree = execFileSync("git", ["-C", dir, "show", "--stat", "--format=", "HEAD"], { encoding: "utf8" }).trim();
+    assert.equal(tree, "", "commits are empty");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("replay refuses an existing output directory", () => {
+  const base = scratch();
+  try {
+    const dir = join(base, "replica");
+    mkdirSync(dir);
+    writeFileSync(join(dir, "keep.txt"), "mine");
+    assert.throws(
+      () => replay(FIXTURE, { dir, name: "Me", email: "me@example.com", offset: "+05:00" }),
+      /already exists/,
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("the rendered script produces byte-identical history to a direct replay", () => {
+  const base = scratch();
+  try {
+    const o: ReplayOpts = { dir: join(base, "from-script"), name: "Me", email: "me@example.com", offset: "+05:00" };
+    const path = join(base, "replay.sh");
+    writeFileSync(path, renderScript(FIXTURE, o));
+    execFileSync("bash", [path], { encoding: "utf8" });
+    const dates = execFileSync("git", ["-C", o.dir, "log", "--reverse", "--format=%aI"], { encoding: "utf8" })
+      .trim()
+      .split("\n");
+    assert.deepEqual(dates, EXPECTED_AT_PLUS_5);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
