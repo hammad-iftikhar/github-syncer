@@ -334,3 +334,71 @@ test("importing the module does not start the interactive flow", async () => {
   assert.equal(typeof mod.collectCommits, "function");
   assert.equal("main" in mod, false, "main stays module-private");
 });
+
+import { collectPrCommits } from "./github-syncer.ts";
+
+test("collectPrCommits pulls the user's own in-range commits out of their PRs", async () => {
+  const asked: string[] = [];
+  const f: Fetcher = async (url) => {
+    if (url.endsWith("/user")) return jsonRes({ login: "me" }, { "x-oauth-scopes": "repo" });
+    if (url.includes("/search/issues")) {
+      asked.push(url);
+      return jsonRes({
+        total_count: 2,
+        items: [
+          { number: 7, repository_url: "https://api.github.com/repos/me/one" },
+          { number: 9, repository_url: "https://api.github.com/repos/org/two" },
+        ],
+      });
+    }
+    if (url.includes("/me/one/pulls/7/commits")) {
+      return jsonRes([
+        { sha: "p1", author: { login: "me" }, commit: { author: { date: "2024-05-01T10:00:00Z" } } },
+        { sha: "p2", author: { login: "colleague" }, commit: { author: { date: "2024-05-02T10:00:00Z" } } },
+        { sha: "p3", author: { login: "me" }, commit: { author: { date: "2023-01-01T10:00:00Z" } } },
+        { sha: "p5", author: null, commit: { author: { date: "2024-05-03T10:00:00Z" } } },
+      ]);
+    }
+    if (url.includes("/org/two/pulls/9/commits")) {
+      return jsonRes([
+        { sha: "p4", author: { login: "me" }, commit: { author: { date: "2024-06-01T10:00:00Z" } } },
+      ]);
+    }
+    throw new Error(`unexpected url ${url}`);
+  };
+  const commits = await collectPrCommits("t", "2024-01-01", "2024-12-31", f);
+  // p2 is a colleague's, p3 predates the range, p5 has no matched author
+  assert.deepEqual(commits.map((c) => c.sha), ["p1", "p4"]);
+  assert.equal(commits[0].repo, "me/one");
+  assert.equal(commits[1].repo, "org/two");
+  assert.match(asked[0], /is%3Apr/);
+  assert.match(asked[0], /author%3Ame/);
+  assert.match(asked[0], /updated%3A%3E%3D2024-01-01/);
+});
+
+test("collectPrCommits follows search pagination", async () => {
+  const f: Fetcher = async (url) => {
+    if (url.endsWith("/user")) return jsonRes({ login: "me" }, { "x-oauth-scopes": "repo" });
+    if (url.includes("/search/issues") && !url.includes("page=2")) {
+      return jsonRes(
+        { total_count: 2, items: [{ number: 1, repository_url: "https://api.github.com/repos/me/a" }] },
+        { link: '<https://api.github.com/search/issues?page=2>; rel="next"' },
+      );
+    }
+    if (url.includes("/search/issues")) {
+      return jsonRes({
+        total_count: 2,
+        items: [{ number: 2, repository_url: "https://api.github.com/repos/me/b" }],
+      });
+    }
+    if (url.includes("/me/a/pulls/1/commits")) {
+      return jsonRes([{ sha: "a1", author: { login: "me" }, commit: { author: { date: "2024-03-01T00:00:00Z" } } }]);
+    }
+    if (url.includes("/me/b/pulls/2/commits")) {
+      return jsonRes([{ sha: "b1", author: { login: "me" }, commit: { author: { date: "2024-04-01T00:00:00Z" } } }]);
+    }
+    throw new Error(`unexpected url ${url}`);
+  };
+  const commits = await collectPrCommits("t", "2024-01-01", "2024-12-31", f);
+  assert.deepEqual(commits.map((c) => c.sha), ["a1", "b1"]);
+});

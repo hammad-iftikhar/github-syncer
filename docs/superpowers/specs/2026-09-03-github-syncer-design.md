@@ -83,6 +83,38 @@ No fork filtering. `?author={login}` already restricts results to the user's
 own commits, so upstream history in a fork is excluded and the user's own
 commits in a fork are kept.
 
+### Pull request commits
+
+Default-branch collection alone misses the commits that matter most on a
+squash-merging team. A squash merge leaves exactly one commit on the default
+branch, dated at merge time, while the commits the author actually wrote — and
+their real timestamps — exist only on the pull request. Commits on open or
+unmerged PR branches are likewise absent from the default branch.
+
+So a second pass always runs, and its results are merged with the first and
+deduplicated by SHA:
+
+1. `GET /search/issues?q=is:pr author:{login} updated:>={since}` enumerates the
+   user's pull requests, following `Link` pagination. `updated:>=` rather than
+   `created:` is the correct prune: a PR holding an in-range commit must have
+   been updated at or after that commit.
+2. `GET /repos/{full_name}/pulls/{number}/commits` reads each PR's commits. This
+   endpoint keeps serving them after the PR branch is deleted, which is what
+   makes squash-merged history recoverable at all.
+3. Commits are kept only where `author.login` matches the user — a shared PR
+   branch carries other people's work — and only where the author date falls in
+   range, since the search prune is deliberately looser than the window.
+
+Two limits of the search endpoint are surfaced rather than worked around: it
+returns at most 1000 results, and it permits 30 requests per minute against the
+5000 per hour the rest of the tool uses. Exceeding the result cap prints a
+warning telling the user to narrow the range. The rate limit is absorbed by the
+existing retry, so a large fetch is slower but not wrong.
+
+Not collected: commits on a non-default branch that never became a pull request,
+and non-commit contributions — PRs opened, reviews, issues — which GitHub counts
+on the graph but which no commit replica can reproduce.
+
 ### Rate limiting
 
 When a response reports the limit exhausted — status `403` or `429` with

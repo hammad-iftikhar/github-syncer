@@ -103,6 +103,9 @@ export interface Commit {
 
 const API = "https://api.github.com";
 
+// whoAmI runs once per collector, but the scope warning is about the token, not the call.
+let scopesWarned = false;
+
 // pushed_at and `since` are both ISO-prefixed, so a string compare is a date compare.
 export function activeRepos(repos: Repo[], since: string): Repo[] {
   return repos.filter((r) => !r.pushed_at || r.pushed_at >= since);
@@ -117,17 +120,20 @@ export function dedupeSort(commits: Commit[]): Commit[] {
 export async function whoAmI(token: string, f: Fetcher = fetch): Promise<string> {
   const res = await ghGet(`${API}/user`, token, f);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText} — token rejected by GET /user`);
-  const scopes = res.headers.get("x-oauth-scopes");
-  if (scopes) {
-    if (!scopes.split(",").map((s) => s.trim()).includes("repo")) {
+  if (!scopesWarned) {
+    scopesWarned = true;
+    const scopes = res.headers.get("x-oauth-scopes");
+    if (scopes) {
+      if (!scopes.split(",").map((s) => s.trim()).includes("repo")) {
+        console.error(
+          "warning: this token's scopes do not include `repo` — private repositories will be invisible to it, so the replica will be incomplete.",
+        );
+      }
+    } else {
       console.error(
-        "warning: this token's scopes do not include `repo` — private repositories will be invisible to it, so the replica will be incomplete.",
+        "warning: token scopes could not be verified (fine-grained tokens don't report them) — confirm this token can read your private repos.",
       );
     }
-  } else {
-    console.error(
-      "warning: token scopes could not be verified (fine-grained tokens don't report them) — confirm this token can read your private repos.",
-    );
   }
   return ((await res.json()) as { login: string }).login;
 }
@@ -163,6 +169,83 @@ export async function collectCommits(
       out.push({ sha: c.sha, repo: repo.full_name, date: c.commit.author.date });
     }
     console.log(`  [${i + 1}/${live.length}] ${repo.full_name}: ${commits.length}`);
+  }
+  return dedupeSort(out);
+}
+
+export interface PrApiCommit extends ApiCommit {
+  author: { login: string } | null;
+}
+
+export interface PrRef {
+  repo: string;
+  number: number;
+}
+
+interface SearchItem {
+  number: number;
+  repository_url: string;
+}
+
+// Squash-merged PRs leave one commit on the default branch, dated at merge time, so the
+// commits the author actually wrote — and their real dates — survive only on the PR itself.
+// /pulls/{n}/commits still serves them after the branch is deleted, which is what makes
+// this recoverable at all.
+async function searchPrs(token: string, login: string, since: string, f: Fetcher = fetch): Promise<PrRef[]> {
+  const q = `is:pr author:${login} updated:>=${since}`;
+  let next: string | null = `${API}/search/issues?q=${encodeURIComponent(q)}&per_page=100`;
+  const out: PrRef[] = [];
+  let capWarned = false;
+  while (next) {
+    const res = await ghGet(next, token, f);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${next}`);
+    const page = (await res.json()) as { total_count: number; items: SearchItem[] };
+    if (!capWarned && page.total_count > 1000) {
+      capWarned = true;
+      console.error(
+        `warning: ${page.total_count} pull requests match but the search API returns at most 1000 — narrow the date range to reach the rest.`,
+      );
+    }
+    for (const item of page.items) {
+      out.push({ repo: item.repository_url.replace(`${API}/repos/`, ""), number: item.number });
+    }
+    next = nextLink(res.headers.get("link"));
+  }
+  return out;
+}
+
+export async function collectPrCommits(
+  token: string,
+  since: string,
+  until: string,
+  f: Fetcher = fetch,
+): Promise<Commit[]> {
+  const login = await whoAmI(token, f);
+  const prs = await searchPrs(token, login, since, f);
+  console.log(`${prs.length} pull requests authored by ${login}, updated since ${since}`);
+
+  const from = `${since}T00:00:00Z`;
+  const to = `${until}T23:59:59Z`;
+  // ponytail: PRs are walked serially, and the search API's 30-requests-per-minute
+  // limit is absorbed reactively by ghGet's retry rather than paced up front. Add
+  // pacing if a large history ends up spending most of its time asleep.
+  const out: Commit[] = [];
+  for (const [i, pr] of prs.entries()) {
+    const commits = await paginate<PrApiCommit>(
+      `${API}/repos/${pr.repo}/pulls/${pr.number}/commits?per_page=100`,
+      token,
+      f,
+    );
+    let mine = 0;
+    for (const c of commits) {
+      const date = c.commit.author?.date;
+      // A shared PR branch carries other people's commits too; only the author's own count.
+      if (!date || c.author?.login !== login) continue;
+      if (date < from || date > to) continue;
+      out.push({ sha: c.sha, repo: pr.repo, date });
+      mine++;
+    }
+    console.log(`  [${i + 1}/${prs.length}] ${pr.repo}#${pr.number}: ${mine}`);
   }
   return dedupeSort(out);
 }
@@ -325,10 +408,17 @@ async function main(): Promise<void> {
     if (!commits) {
       const since = await askValid(rl, "Since date (YYYY-MM-DD)", isoDaysAgo(365), isDate, signal);
       const until = await askValid(rl, "Until date (YYYY-MM-DD)", isoDaysAgo(0), isDate, signal);
-      console.log("\nfetching...");
-      commits = await collectCommits(token, since, until);
+      console.log("\nfetching default-branch commits...");
+      const onBranch = await collectCommits(token, since, until);
+      console.log("\nfetching pull request commits...");
+      const inPrs = await collectPrCommits(token, since, until);
+      commits = dedupeSort([...onBranch, ...inPrs]);
       writeFileSync(CACHE, `${JSON.stringify(commits, null, 2)}\n`);
-      console.log(`\ncached ${commits.length} commits to ${CACHE}`);
+      const overlap = onBranch.length + inPrs.length - commits.length;
+      console.log(
+        `\ncached ${commits.length} commits to ${CACHE} ` +
+          `(${onBranch.length} on default branches, ${inPrs.length} in PRs, ${overlap} in both)`,
+      );
     }
 
     if (commits.length === 0) {
