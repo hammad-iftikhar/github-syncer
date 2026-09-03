@@ -44,3 +44,74 @@ test("isOffset accepts signed HH:MM only", () => {
   assert.equal(isOffset("05:00"), false);
   assert.equal(isOffset("+5:00"), false);
 });
+
+import { nextLink, ghGet, paginate, type Fetcher } from "./github-syncer.ts";
+
+function jsonRes(body: unknown, headers: Record<string, string> = {}, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
+}
+
+test("nextLink extracts the rel=next URL", () => {
+  const h = '<https://api.github.com/x?page=2>; rel="next", <https://api.github.com/x?page=9>; rel="last"';
+  assert.equal(nextLink(h), "https://api.github.com/x?page=2");
+});
+
+test("nextLink returns null when there is no next page", () => {
+  assert.equal(nextLink('<https://api.github.com/x?page=1>; rel="prev"'), null);
+  assert.equal(nextLink(null), null);
+});
+
+test("ghGet sends the bearer token", async () => {
+  let seen: string | undefined;
+  const f: Fetcher = async (_url, init) => {
+    seen = new Headers(init?.headers).get("authorization") ?? undefined;
+    return jsonRes([]);
+  };
+  await ghGet("https://api.github.com/user", "tok123", f);
+  assert.equal(seen, "Bearer tok123");
+});
+
+test("ghGet sleeps and retries once when the rate limit is exhausted", async () => {
+  const calls: string[] = [];
+  let slept = 0;
+  const reset = Math.floor(Date.now() / 1000) + 30;
+  const f: Fetcher = async () => {
+    calls.push("call");
+    return calls.length === 1
+      ? jsonRes({ message: "rate limited" }, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) }, 403)
+      : jsonRes([{ ok: true }]);
+  };
+  const res = await ghGet("https://api.github.com/user", "t", f, async (ms) => { slept = ms; });
+  assert.equal(calls.length, 2);
+  assert.equal(res.status, 200);
+  assert.ok(slept > 25_000 && slept <= 32_000, `slept ${slept}`);
+});
+
+test("ghGet does not retry a 403 that is not a rate limit", async () => {
+  let n = 0;
+  const f: Fetcher = async () => { n++; return jsonRes({ message: "forbidden" }, {}, 403); };
+  const res = await ghGet("https://api.github.com/user", "t", f, async () => {});
+  assert.equal(n, 1);
+  assert.equal(res.status, 403);
+});
+
+test("paginate follows Link headers and concatenates pages", async () => {
+  const f: Fetcher = async (url) =>
+    url.includes("page=2")
+      ? jsonRes([{ id: 3 }])
+      : jsonRes([{ id: 1 }, { id: 2 }], { link: '<https://api.github.com/r?page=2>; rel="next"' });
+  const all = await paginate<{ id: number }>("https://api.github.com/r", "t", f);
+  assert.deepEqual(all.map((x) => x.id), [1, 2, 3]);
+});
+
+test("paginate treats 409 and 404 as an empty repository", async () => {
+  const empty: Fetcher = async () => jsonRes({ message: "Git Repository is empty." }, {}, 409);
+  assert.deepEqual(await paginate("https://api.github.com/r/commits", "t", empty), []);
+  const gone: Fetcher = async () => jsonRes({ message: "Not Found" }, {}, 404);
+  assert.deepEqual(await paginate("https://api.github.com/r/commits", "t", gone), []);
+});
+
+test("paginate throws on other errors", async () => {
+  const boom: Fetcher = async () => jsonRes({ message: "server error" }, {}, 500);
+  await assert.rejects(() => paginate("https://api.github.com/r", "t", boom), /500/);
+});

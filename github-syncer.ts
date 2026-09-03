@@ -22,3 +22,52 @@ export const isDate = (s: string): boolean =>
   /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(s));
 
 export const isOffset = (s: string): boolean => /^[+-]\d{2}:\d{2}$/.test(s);
+
+export type Fetcher = (url: string, init?: RequestInit) => Promise<Response>;
+
+const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+export function nextLink(header: string | null): string | null {
+  if (!header) return null;
+  const m = /<([^>]+)>;\s*rel="next"/.exec(header);
+  return m ? m[1] : null;
+}
+
+export async function ghGet(
+  url: string,
+  token: string,
+  f: Fetcher = fetch,
+  sleep: (ms: number) => Promise<void> = realSleep,
+): Promise<Response> {
+  for (;;) {
+    const res = await f(url, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: "application/vnd.github+json",
+        "x-github-api-version": "2022-11-28",
+        "user-agent": "github-syncer",
+      },
+    });
+    const exhausted =
+      (res.status === 403 || res.status === 429) && res.headers.get("x-ratelimit-remaining") === "0";
+    if (!exhausted) return res;
+    const reset = Number(res.headers.get("x-ratelimit-reset") ?? 0) * 1000;
+    const wait = Math.max(1_000, reset - Date.now() + 1_000);
+    console.error(`rate limit hit, sleeping ${Math.round(wait / 1000)}s`);
+    await sleep(wait);
+  }
+}
+
+export async function paginate<T>(url: string, token: string, f: Fetcher = fetch): Promise<T[]> {
+  const out: T[] = [];
+  let next: string | null = url;
+  while (next) {
+    const res = await ghGet(next, token, f);
+    // 409 = empty repo, 404 = access lost between listing and reading. Neither is fatal.
+    if (res.status === 409 || res.status === 404) return out;
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${next}`);
+    out.push(...((await res.json()) as T[]));
+    next = nextLink(res.headers.get("link"));
+  }
+  return out;
+}
