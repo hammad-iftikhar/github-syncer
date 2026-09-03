@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface, type Interface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { resolve } from "node:path";
@@ -159,7 +159,9 @@ export async function fetchCalendar(
     const { viewer } = (await ghGraphQL(CALENDAR_QUERY, window, token, f)).data!;
     const calendar = viewer.contributionsCollection.contributionCalendar;
     login = viewer.login;
-    restricted = Math.max(restricted, viewer.contributionsCollection.restrictedContributionsCount);
+    // A per-window total over near-disjoint sets, so summing is right; the two-day
+    // overlaps make it a slight over-estimate, hence "about" when it is reported.
+    restricted += viewer.contributionsCollection.restrictedContributionsCount;
 
     let walked = 0;
     for (const week of calendar.weeks) {
@@ -175,10 +177,12 @@ export async function fetchCalendar(
     // The API reports the window's own total, so a mismatch against the days we walked
     // means the calendar was parsed wrong — the one failure that would otherwise show up
     // as a quietly short replica rather than an error.
-    if (walked !== calendar.totalContributions) {
+    // Only a shortfall is a fault: `weeks` is week-aligned and so overhangs the window,
+    // which makes walked > total ordinary. Those extra dates are filtered by range below.
+    if (walked < calendar.totalContributions) {
       console.error(
         `warning: window ${window.from.slice(0, 10)}..${window.to.slice(0, 10)} reports ` +
-          `${calendar.totalContributions} contributions but its days sum to ${walked} — ` +
+          `${calendar.totalContributions} contributions but its days sum to only ${walked} — ` +
           "the replica may be short. Please report this.",
       );
     }
@@ -191,7 +195,7 @@ export async function fetchCalendar(
   console.log(`${total} contributions across ${days.length} active days for ${login}`);
   if (restricted > 0) {
     console.log(
-      `  note: ${restricted} contributions are reported as restricted — made in private ` +
+      `  note: about ${restricted} contributions are reported as restricted — made in private ` +
         "repositories this token cannot see.",
     );
     console.log(
@@ -275,6 +279,9 @@ export function renderScript(entries: Entry[], o: ReplayOpts): string {
   const lines = [
     "#!/usr/bin/env bash",
     "set -e",
+    // Same reason replay() clears these: inherited from the caller they override -C and
+    // would land every commit below in another repository.
+    "unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE",
     `test -e ${shq(o.dir)} && { echo ${shq(`${o.dir} already exists — refusing to append to it`)} >&2; exit 1; }`,
     `git init -q -b main -- ${shq(o.dir)}`,
     "",
@@ -312,7 +319,8 @@ function readCache(): Cache | null {
   }
   const c = parsed as Cache;
   const ok =
-    c && typeof c.login === "string" && isDate(c.since) && isDate(c.until) &&
+    c && typeof c.login === "string" && typeof c.fetchedAt === "string" &&
+    isDate(c.since) && isDate(c.until) &&
     Array.isArray(c.days) &&
     c.days.every((d) => d && isDate(d.date) && Number.isInteger(d.count) && d.count > 0);
   if (!ok) {

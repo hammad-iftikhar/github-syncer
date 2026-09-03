@@ -121,7 +121,7 @@ test("every date in range is fully interior to some window, contributions' offse
       to: Date.parse(w.to),
     }));
     for (const w of windows) {
-      assert.ok(w.to - w.from <= 365 * 86_400_000, "each window stays inside the API's one-year cap");
+      assert.ok(w.to - w.from <= 364 * 86_400_000, "each window stays inside the API's one-year cap");
     }
     for (let t = Date.parse(`${since}T00:00:00Z`); t <= Date.parse(`${until}T00:00:00Z`); t += 86_400_000) {
       const lo = t - SPAN;
@@ -194,14 +194,24 @@ test("a date seen partially at a window seam takes its full count from the other
   // seam comes back with only part of its contributions. Windows overlap by two days so
   // that date is also returned whole by the neighbouring window, and Math.max must take
   // the whole one. Keeping the partial would silently undercount that square.
-  let call = 0;
-  const f: Fetcher = async () => {
-    call++;
-    // window 1 sees the seam date partially; window 2 contains it whole
-    return calendarRes([{ date: "2026-09-01", contributionCount: call === 1 ? 4 : 13 }]);
+  //
+  // The stub answers according to the window it is actually handed — a full count only
+  // when the date's whole instant span (its UTC day plus 14h either side) is inside the
+  // window, a partial otherwise. That is what makes this test fail against windows that
+  // do not overlap: there, no window holds the seam date whole, so 4 is all it can see.
+  const SPAN = 14 * 3_600_000;
+  const dayStart = Date.parse("2026-09-01T00:00:00Z");
+  const dayEnd = dayStart + 86_400_000 - 1000;
+  let calls = 0;
+  const f: Fetcher = async (_url, init) => {
+    calls++;
+    const { variables } = JSON.parse(init!.body as string) as { variables: { from: string; to: string } };
+    const whole =
+      Date.parse(variables.from) <= dayStart - SPAN && Date.parse(variables.to) >= dayEnd + SPAN;
+    return calendarRes([{ date: "2026-09-01", contributionCount: whole ? 13 : 4 }]);
   };
   const { days } = await fetchCalendar("t", "2025-09-03", "2026-09-03", f);
-  assert.ok(call >= 2, `expected overlapping windows, got ${call} queries`);
+  assert.ok(calls >= 2, `expected more than one window, got ${calls}`);
   assert.deepEqual(days, [{ date: "2026-09-01", count: 13 }]);
 });
 
@@ -409,6 +419,19 @@ test("the generated script writes the same author dates as a direct replay", () 
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+test("the generated script unsets the git env vars that would redirect the commits", () => {
+  // GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE in the shell running replay.sh override -C, so
+  // without this the whole replayed history lands in whatever repo they point at.
+  const o: ReplayOpts = { dir: "/tmp/x", name: "Me", email: "me@example.com", offset: "+05:00" };
+  const lines = renderScript(FIXTURE, o).split("\n");
+  const unsetIndex = lines.findIndex((l) => l.startsWith("unset "));
+  assert.ok(unsetIndex !== -1, "an unset line exists");
+  for (const v of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]) {
+    assert.ok(lines[unsetIndex].includes(v), `${v} is unset`);
+  }
+  assert.ok(unsetIndex < lines.findIndex((l) => l.includes("git init")), "it runs before git init");
 });
 
 test("renderScript escapes a single quote in the output directory path everywhere it appears", () => {

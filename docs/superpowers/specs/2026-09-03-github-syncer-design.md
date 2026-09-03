@@ -133,13 +133,18 @@ the API. Instead:
 
 ### Integrity check
 
-Each window reports its own `totalContributions`. The days walked out of that window's
-`weeks` must sum to it; a mismatch means the calendar was parsed wrong, and is reported as
-a warning naming both numbers. This is the check that turns the whole class of
+Each window reports its own `totalContributions`. Only a *shortfall* is a fault: the
+`weeks` array is week-aligned and the windows are padded, so it ordinarily contains days
+outside the window and sums to more than the reported total — those dates are discarded by
+the range filter. Summing to *less* than the total means days were lost in parsing, and is
+reported as a warning naming both numbers. This is the check that turns the whole class of
 "quietly short replica" bug into something the user sees on the first run. Requesting
 `totalContributions` costs nothing extra, since it rides in the same query.
 
-`restrictedContributionsCount` is reported when non-zero. The message states the
+`restrictedContributionsCount` is a per-window total over near-disjoint sets rather than a
+per-date property, so it is summed across windows and reported as an approximation — the
+two-day overlaps make it a slight over-estimate. Taking a maximum instead, as an earlier
+revision did, understated it by a factor of the window count. The message states the
 consequence — that contributions were made in private repositories this token cannot see,
 and that a total lower than the profile graph means the token needs `repo` scope — rather
 than implying anything about whether those contributions are inside the daily counts.
@@ -170,8 +175,10 @@ status check and throws; a GraphQL `RATE_LIMITED` error arrives inside a 200 and
 The provenance fields exist so a stale cache cannot be reused blindly: the login is shown
 in the reuse prompt, and the requested range is recorded because the first and last
 *active* dates are not the same thing as the range that was asked for. The file is
-validated on read — shape, date formats, and positive integer counts — and a malformed
-cache is reported and ignored rather than parsed into a wrong replica.
+validated on read — every field's type, both date formats, and positive integer counts,
+`fetchedAt` included, since the reuse banner formats it — and a malformed cache is
+reported and ignored rather than parsed into a wrong replica or crashing on a missing
+field.
 
 ## Synthesising commits
 
@@ -276,10 +283,12 @@ counted contributions produce 22 commits all on the same square.
 The second is that every date in the requested range is wholly interior to some window —
 the property that makes `Math.max` correct. It is tested directly, over four ranges from
 one day to a decade, by checking that each date's UTC day plus fourteen hours on either
-side fits inside a single window. A companion test feeds two overlapping windows a
-partial count and a full count for the same seam date and asserts the full one survives;
-that test fails against the `Math.max`-over-non-overlapping-windows arrangement this
-design previously specified.
+side fits inside a single window. A companion test feeds the calendar a stub that answers according to the window it is
+actually handed — a full count only when the seam date's whole instant span is inside the
+window, a partial otherwise — and asserts the full count survives. Against
+non-overlapping windows no window holds that date whole, so the partial is all it can see
+and the test fails; that was verified directly against the previous geometry rather than
+assumed.
 
 The generated script is executed with bash and its author dates compared against the
 direct replay, so the two paths cannot silently diverge. Quoting, the script's guard line,
