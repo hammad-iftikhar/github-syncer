@@ -92,7 +92,7 @@ export interface Repo {
 
 export interface ApiCommit {
   sha: string;
-  commit: { author: { date: string } | null };
+  commit: { author: { date: string; email?: string } | null };
 }
 
 export interface Commit {
@@ -191,8 +191,29 @@ interface SearchItem {
 // commits the author actually wrote — and their real dates — survive only on the PR itself.
 // /pulls/{n}/commits still serves them after the branch is deleted, which is what makes
 // this recoverable at all.
+// GitHub resolves a commit's `author` field by matching its git email against emails
+// verified on an account, so `author` is null whenever the email is linked to nobody —
+// indistinguishable from a colleague's commit by login alone. Asking the account which
+// emails are its own is the only non-circular way to tell the two apart: the default-branch
+// pass cannot supply them, since ?author=<login> already only matches linked emails.
+export async function myEmails(token: string, f: Fetcher = fetch): Promise<Set<string>> {
+  const res = await ghGet(`${API}/user/emails?per_page=100`, token, f);
+  if (!res.ok) {
+    console.error(
+      `warning: could not read your verified emails (${res.status}) — the token lacks \`user:email\` scope. ` +
+        "Commits authored under an email that is not linked to your account cannot be told apart from a colleague's and will be skipped.",
+    );
+    return new Set();
+  }
+  const emails = (await res.json()) as { email: string }[];
+  return new Set(emails.map((e) => e.email.toLowerCase()));
+}
+
 async function searchPrs(token: string, login: string, since: string, f: Fetcher = fetch): Promise<PrRef[]> {
-  const q = `is:pr author:${login} updated:>=${since}`;
+// involves: rather than author: — on a shared branch a teammate often opens the PR that
+// carries your commits, and the per-commit filter below is what actually narrows to you.
+// The cost is more PRs to walk, not less accuracy.
+  const q = `is:pr involves:${login} updated:>=${since}`;
   let next: string | null = `${API}/search/issues?q=${encodeURIComponent(q)}&per_page=100`;
   const out: PrRef[] = [];
   let capWarned = false;
@@ -209,7 +230,10 @@ async function searchPrs(token: string, login: string, since: string, f: Fetcher
     for (const item of page.items) {
       out.push({ repo: item.repository_url.replace(`${API}/repos/`, ""), number: item.number });
     }
-    next = nextLink(res.headers.get("link"));
+    // Stop at the documented ceiling rather than trusting the Link header past it —
+    // requests beyond 1000 results are rejected, and a throw here would discard the
+    // default-branch commits already collected.
+    next = out.length >= 1000 ? null : nextLink(res.headers.get("link"));
   }
   return out;
 }
@@ -221,8 +245,9 @@ export async function collectPrCommits(
   f: Fetcher = fetch,
 ): Promise<Commit[]> {
   const login = await whoAmI(token, f);
+  const emails = await myEmails(token, f);
   const prs = await searchPrs(token, login, since, f);
-  console.log(`${prs.length} pull requests authored by ${login}, updated since ${since}`);
+  console.log(`${prs.length} pull requests involving ${login}, updated since ${since}`);
 
   const from = `${since}T00:00:00Z`;
   const to = `${until}T23:59:59Z`;
@@ -230,6 +255,7 @@ export async function collectPrCommits(
   // limit is absorbed reactively by ghGet's retry rather than paced up front. Add
   // pacing if a large history ends up spending most of its time asleep.
   const out: Commit[] = [];
+  const unmatched = new Map<string, number>();
   for (const [i, pr] of prs.entries()) {
     const commits = await paginate<PrApiCommit>(
       `${API}/repos/${pr.repo}/pulls/${pr.number}/commits?per_page=100`,
@@ -239,13 +265,26 @@ export async function collectPrCommits(
     let mine = 0;
     for (const c of commits) {
       const date = c.commit.author?.date;
-      // A shared PR branch carries other people's commits too; only the author's own count.
-      if (!date || c.author?.login !== login) continue;
-      if (date < from || date > to) continue;
-      out.push({ sha: c.sha, repo: pr.repo, date });
-      mine++;
+      if (!date || date < from || date > to) continue;
+      // A shared PR branch carries other people's commits too, so narrow to this user —
+      // by matched account when GitHub resolved one, otherwise by the commit's own email.
+      const email = c.commit.author?.email?.toLowerCase();
+      if (c.author?.login === login || (email && emails.has(email))) {
+        out.push({ sha: c.sha, repo: pr.repo, date });
+        mine++;
+      } else if (!c.author && email) {
+        unmatched.set(email, (unmatched.get(email) ?? 0) + 1);
+      }
     }
     console.log(`  [${i + 1}/${prs.length}] ${pr.repo}#${pr.number}: ${mine}`);
+  }
+  // Never let a skipped commit be invisible — this is the one place the tool can quietly
+  // under-report the user's own history, so it names the emails it could not attribute.
+  for (const [email, n] of unmatched) {
+    console.error(
+      `warning: skipped ${n} commit(s) authored as <${email}>, which is not linked to your account. ` +
+        "Add and verify that email on the account, or those commits cannot be attributed to you.",
+    );
   }
   return dedupeSort(out);
 }
@@ -411,7 +450,15 @@ async function main(): Promise<void> {
       console.log("\nfetching default-branch commits...");
       const onBranch = await collectCommits(token, since, until);
       console.log("\nfetching pull request commits...");
-      const inPrs = await collectPrCommits(token, since, until);
+      // A PR-phase failure must not discard the default-branch commits already in hand —
+      // that pass can be thousands of requests, and the cache is only written once below.
+      let inPrs: Commit[] = [];
+      try {
+        inPrs = await collectPrCommits(token, since, until);
+      } catch (err) {
+        console.error(`\nwarning: pull request commits failed (${(err as Error).message})`);
+        console.error("keeping the default-branch commits — rerun to retry the PR pass.");
+      }
       commits = dedupeSort([...onBranch, ...inPrs]);
       writeFileSync(CACHE, `${JSON.stringify(commits, null, 2)}\n`);
       const overlap = onBranch.length + inPrs.length - commits.length;

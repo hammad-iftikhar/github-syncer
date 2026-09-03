@@ -341,6 +341,7 @@ test("collectPrCommits pulls the user's own in-range commits out of their PRs", 
   const asked: string[] = [];
   const f: Fetcher = async (url) => {
     if (url.endsWith("/user")) return jsonRes({ login: "me" }, { "x-oauth-scopes": "repo" });
+    if (url.includes("/user/emails")) return jsonRes([{ email: "me@example.com" }]);
     if (url.includes("/search/issues")) {
       asked.push(url);
       return jsonRes({
@@ -356,7 +357,7 @@ test("collectPrCommits pulls the user's own in-range commits out of their PRs", 
         { sha: "p1", author: { login: "me" }, commit: { author: { date: "2024-05-01T10:00:00Z" } } },
         { sha: "p2", author: { login: "colleague" }, commit: { author: { date: "2024-05-02T10:00:00Z" } } },
         { sha: "p3", author: { login: "me" }, commit: { author: { date: "2023-01-01T10:00:00Z" } } },
-        { sha: "p5", author: null, commit: { author: { date: "2024-05-03T10:00:00Z" } } },
+        { sha: "p5", author: null, commit: { author: { date: "2024-05-03T10:00:00Z", email: "nobody@example.com" } } },
       ]);
     }
     if (url.includes("/org/two/pulls/9/commits")) {
@@ -367,18 +368,19 @@ test("collectPrCommits pulls the user's own in-range commits out of their PRs", 
     throw new Error(`unexpected url ${url}`);
   };
   const commits = await collectPrCommits("t", "2024-01-01", "2024-12-31", f);
-  // p2 is a colleague's, p3 predates the range, p5 has no matched author
+  // p2 is a colleague's, p3 predates the range, p5's email is nobody's
   assert.deepEqual(commits.map((c) => c.sha), ["p1", "p4"]);
   assert.equal(commits[0].repo, "me/one");
   assert.equal(commits[1].repo, "org/two");
   assert.match(asked[0], /is%3Apr/);
-  assert.match(asked[0], /author%3Ame/);
+  assert.match(asked[0], /involves%3Ame/);
   assert.match(asked[0], /updated%3A%3E%3D2024-01-01/);
 });
 
 test("collectPrCommits follows search pagination", async () => {
   const f: Fetcher = async (url) => {
     if (url.endsWith("/user")) return jsonRes({ login: "me" }, { "x-oauth-scopes": "repo" });
+    if (url.includes("/user/emails")) return jsonRes([{ email: "me@example.com" }]);
     if (url.includes("/search/issues") && !url.includes("page=2")) {
       return jsonRes(
         { total_count: 2, items: [{ number: 1, repository_url: "https://api.github.com/repos/me/a" }] },
@@ -401,4 +403,64 @@ test("collectPrCommits follows search pagination", async () => {
   };
   const commits = await collectPrCommits("t", "2024-01-01", "2024-12-31", f);
   assert.deepEqual(commits.map((c) => c.sha), ["a1", "b1"]);
+});
+
+import { myEmails } from "./github-syncer.ts";
+
+test("collectPrCommits recovers the user's commits when GitHub matched no account", async () => {
+  // The case the whole PR pass exists for: a work email that is verified on the account
+  // but that GitHub did not resolve into an `author` object on this endpoint.
+  const f: Fetcher = async (url) => {
+    if (url.endsWith("/user")) return jsonRes({ login: "me" }, { "x-oauth-scopes": "repo,user:email" });
+    if (url.includes("/user/emails")) {
+      return jsonRes([{ email: "me@work.example" }, { email: "me@personal.example" }]);
+    }
+    if (url.includes("/search/issues")) {
+      return jsonRes({
+        total_count: 1,
+        items: [{ number: 3, repository_url: "https://api.github.com/repos/org/repo" }],
+      });
+    }
+    if (url.includes("/org/repo/pulls/3/commits")) {
+      return jsonRes([
+        // unmatched by GitHub, but authored under a verified email of ours
+        { sha: "mine", author: null, commit: { author: { date: "2024-07-01T09:00:00Z", email: "ME@Work.example" } } },
+        // unmatched and genuinely not ours
+        { sha: "theirs", author: null, commit: { author: { date: "2024-07-02T09:00:00Z", email: "other@example.com" } } },
+      ]);
+    }
+    throw new Error(`unexpected url ${url}`);
+  };
+  const commits = await collectPrCommits("t", "2024-01-01", "2024-12-31", f);
+  assert.deepEqual(commits.map((c) => c.sha), ["mine"], "email match is case-insensitive and recovers the commit");
+});
+
+test("myEmails degrades to an empty set when the token lacks user:email scope", async () => {
+  const f: Fetcher = async () => jsonRes({ message: "Requires user:email" }, {}, 403);
+  assert.deepEqual([...(await myEmails("t", f))], []);
+});
+
+test("searchPrs stops at the search API's 1000-result ceiling", async () => {
+  let pages = 0;
+  const f: Fetcher = async (url) => {
+    if (url.endsWith("/user")) return jsonRes({ login: "me" }, { "x-oauth-scopes": "repo" });
+    if (url.includes("/user/emails")) return jsonRes([]);
+    if (url.includes("/search/issues")) {
+      pages++;
+      return jsonRes(
+        {
+          total_count: 5000,
+          items: Array.from({ length: 100 }, (_, i) => ({
+            number: pages * 100 + i,
+            repository_url: "https://api.github.com/repos/me/r",
+          })),
+        },
+        { link: '<https://api.github.com/search/issues?page=99>; rel="next"' },
+      );
+    }
+    if (url.includes("/pulls/")) return jsonRes([]);
+    throw new Error(`unexpected url ${url}`);
+  };
+  await collectPrCommits("t", "2024-01-01", "2024-12-31", f);
+  assert.equal(pages, 10, "10 pages of 100 reaches the cap and stops, despite a next link");
 });

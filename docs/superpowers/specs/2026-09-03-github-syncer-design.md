@@ -94,22 +94,48 @@ unmerged PR branches are likewise absent from the default branch.
 So a second pass always runs, and its results are merged with the first and
 deduplicated by SHA:
 
-1. `GET /search/issues?q=is:pr author:{login} updated:>={since}` enumerates the
-   user's pull requests, following `Link` pagination. `updated:>=` rather than
-   `created:` is the correct prune: a PR holding an in-range commit must have
-   been updated at or after that commit.
+1. `GET /search/issues?q=is:pr involves:{login} updated:>={since}` enumerates the
+   pull requests, following `Link` pagination and stopping at the endpoint's
+   1000-result ceiling rather than trusting a `Link` header past it. `updated:>=`
+   rather than `created:` is the correct prune: a PR holding an in-range commit
+   must have been updated at or after that commit. `involves:` rather than
+   `author:` because a teammate frequently opens the PR that carries the user's
+   commits on a shared branch; per-PR precision is not the goal, since step 3
+   narrows per commit.
 2. `GET /repos/{full_name}/pulls/{number}/commits` reads each PR's commits. This
    endpoint keeps serving them after the PR branch is deleted, which is what
    makes squash-merged history recoverable at all.
-3. Commits are kept only where `author.login` matches the user — a shared PR
-   branch carries other people's work — and only where the author date falls in
-   range, since the search prune is deliberately looser than the window.
+3. Commits are kept only where the author date falls in range — the search prune
+   is deliberately looser than the window — and only where the commit is the
+   user's own.
+
+Establishing "the user's own" is the subtle part, and the one place the tool can
+silently under-report. GitHub resolves a commit's `author` field by matching its
+git email against emails verified on an account, so `author` is null whenever the
+email belongs to no account — indistinguishable from a colleague's commit by
+login alone. The default-branch pass cannot supply the missing emails either: its
+server-side `?author={login}` filter only matches emails that are already linked,
+so deriving a known-email set from its results is circular and buys nothing.
+
+The tool therefore asks the account directly: `GET /user/emails` (requires
+`user:email` scope) yields the verified set, and a commit counts as the user's
+when either its `author.login` matches or its git email is in that set, compared
+case-insensitively. When the scope is absent the call fails soft to an empty set
+with a warning. Any commit that is skipped because its email matched nothing is
+counted per email address and reported at the end of the pass, so an
+under-reported history is visible rather than silent.
+
+A failure anywhere in this pass is caught: the default-branch commits already
+collected are cached with a warning rather than discarded, because that pass can
+cost thousands of requests and the cache is written only once.
 
 Two limits of the search endpoint are surfaced rather than worked around: it
 returns at most 1000 results, and it permits 30 requests per minute against the
-5000 per hour the rest of the tool uses. Exceeding the result cap prints a
-warning telling the user to narrow the range. The rate limit is absorbed by the
-existing retry, so a large fetch is slower but not wrong.
+5000 per hour the rest of the tool uses. Pagination halts at 1000 collected
+results and prints a warning telling the user to narrow the range — halting is
+what keeps a rejected request past the ceiling from throwing away the
+default-branch work. The rate limit is absorbed by the existing retry, so a large
+fetch is slower but not wrong.
 
 Not collected: commits on a non-default branch that never became a pull request,
 and non-commit contributions — PRs opened, reviews, issues — which GitHub counts
