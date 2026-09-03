@@ -95,6 +95,21 @@ test("ghGet does not retry a 403 that is not a rate limit", async () => {
   assert.equal(res.status, 403);
 });
 
+test("ghGet handles malformed x-ratelimit-reset with a safe fallback", async () => {
+  const calls: string[] = [];
+  let slept = 0;
+  const f: Fetcher = async () => {
+    calls.push("call");
+    return calls.length === 1
+      ? jsonRes({ message: "rate limited" }, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "soon" }, 403)
+      : jsonRes([{ ok: true }]);
+  };
+  const res = await ghGet("https://api.github.com/user", "t", f, async (ms) => { slept = ms; });
+  assert.equal(calls.length, 2);
+  assert.equal(res.status, 200);
+  assert.ok(slept >= 1_000, `slept ${slept}`);
+});
+
 test("paginate follows Link headers and concatenates pages", async () => {
   const f: Fetcher = async (url) =>
     url.includes("page=2")
