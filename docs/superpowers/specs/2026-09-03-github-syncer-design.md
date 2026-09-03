@@ -83,9 +83,12 @@ commits in a fork are kept.
 
 ### Rate limiting
 
-Read `X-RateLimit-Remaining` from every response. When it reaches `0`, sleep
-until the epoch second in `X-RateLimit-Reset` (plus one second) and retry the
-same request. No exponential backoff, no retry library.
+When a response reports the limit exhausted — status `403` or `429` with
+`X-RateLimit-Remaining: 0` — sleep until the epoch second in
+`X-RateLimit-Reset` (plus one second) and retry the same request. Reacting to
+the rejection rather than pre-emptively sleeping on `remaining: 0` avoids
+stalling for an hour after the final request of a run. No exponential backoff,
+no retry library.
 
 ### commits.json
 
@@ -149,9 +152,10 @@ replay otherwise looks hung.
 
 When prompt 8 selects script output, the same commands are written to
 `replay.sh` instead of being executed: a `set -e` header, the `git init`, one
-`git commit` line per commit with its dates inline, and the closing `git push`
-hint as an `echo`. The script is not made executable and is not run; the tool
-prints `bash replay.sh` as the next step.
+`git commit` line per commit with its dates inline, and a closing `echo`
+reporting the commit count. The script is not made executable and is not run;
+the tool prints `bash replay.sh` as the next step, and the `git push`
+instructions are left to that later run rather than baked into the script.
 
 Values interpolated into `replay.sh` are single-quoted with embedded single
 quotes escaped.
