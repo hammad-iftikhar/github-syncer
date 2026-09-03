@@ -1,49 +1,65 @@
 # github-syncer — design
 
 **Date:** 2026-09-03
-**Status:** approved
+**Status:** approved (revised — see History)
 
 ## Purpose
 
-Read the commit history of a GitHub account via the API, then rebuild that
-history as backdated empty commits in a fresh local git repo attributed to a
-different account. Pushing the replica makes the source account's activity —
-including commits in private repos — visible on the destination account's
-contribution graph.
+Read the contribution graph of a GitHub account via the GraphQL API, then rebuild
+it as backdated empty commits in a fresh local git repo attributed to a different
+account. One empty commit per counted contribution, on the day it was counted.
+Pushing the replica makes the destination account's contribution graph match the
+source's, square for square.
 
-Intended use is a single person consolidating their own activity: a work
-account as source, a personal profile as destination. It is not a tool for
-claiming work you did not do.
+Intended use is a single person consolidating their own activity: a work account as
+source, a personal profile as destination. It is not a tool for claiming work you
+did not do.
 
 ## Non-goals
 
 - Copying code, diffs, branches, or commit messages. Commits are empty.
+- Reproducing per-commit times of day. The graph never displayed them.
 - Pushing. The tool prints the `git remote add` / `git push` commands and stops.
 - Creating the destination repo via API.
 - Any non-interactive interface: no CLI flags, no config file.
-- Resuming a partially-completed fetch.
+- Resuming a partially-completed replay.
+
+## Why the graph, not the commit log
+
+Per GitHub's contributions reference, the graph counts commits, opening an issue,
+proposing a pull request, submitting a pull request review, opening or answering a
+discussion, and creating or forking a repository. Merging a pull request is not
+itself a contribution: it counts through the merge commit and through the PR having
+been opened.
+
+A commit counts only when its author email is linked to the account, it sits on a
+default or `gh-pages` branch, and the repository is not a fork. That last condition
+is why summing REST endpoints cannot reproduce the graph: the individual commits
+behind a squash-merged pull request never appeared on the source graph, because
+squashing leaves only one commit on the default branch. Collecting them over-counts
+the user.
+
+`contributionsCollection.contributionCalendar` returns the graph's own daily
+numbers, so it is correct by construction and costs one query per year rather than
+one per repository.
 
 ## Runtime
 
 Single file `github-syncer.ts`, run as `node github-syncer.ts`. Node 24 strips
 TypeScript types natively, so there is no build step and no `tsconfig.json` is
 required to run. Zero dependencies: global `fetch`, `node:readline/promises`,
-`node:child_process`, `node:fs`.
-
-A `tsconfig.json` may be added purely for editor type-checking; it is not part
-of the run path.
+`node:child_process`, `node:fs`, `node:path`, `node:process`.
 
 ## Interaction
 
-Nine prompts, asked in order. Every prompt accepts its default on
-a bare Enter.
+Nine prompts, asked in order. Every prompt accepts its default on a bare Enter.
 
 | # | Prompt | Default |
 |---|--------|---------|
 | 1 | Source GitHub token | `$GITHUB_TOKEN` if set; otherwise prompt with terminal echo muted |
 | 2 | Since date (`YYYY-MM-DD`) | one year before today |
 | 3 | Until date (`YYYY-MM-DD`) | today |
-| 4 | Replay timezone offset | the machine's current UTC offset, e.g. `+05:00` |
+| 4 | Timezone offset to stamp commits with | the machine's current UTC offset |
 | 5 | Destination author name | `git config user.name` |
 | 6 | Destination author email | `git config user.email` |
 | 7 | Output directory | `./replica` |
@@ -54,218 +70,155 @@ Prompt 6 prints a warning that the email must be a *verified* email on the
 destination account, or GitHub attributes the commits to no one and the
 contribution graph stays empty.
 
-Prompt 9 prints the commit count, the earliest and latest commit dates, the
-destination identity, and the output path before the output directory or
-`replay.sh` is written. `commits.json` is the exception: it is deliberately
-written earlier, as a cache, so an aborted run does not have to re-fetch.
-It is the only prompt that defaults to no.
+Prompt 9 prints the contribution total, the number of active days, the date range,
+the busiest day, the destination identity, and the output path before anything is
+written to the output directory or to `replay.sh`. It is the only prompt that
+defaults to no. `contributions.json` is the exception: it is deliberately written
+earlier, as a cache, so an aborted run does not have to re-fetch.
 
-Dates from prompts 2 and 3 are validated as `YYYY-MM-DD` and re-asked on bad
-input. Prompt 4 is validated as `±HH:MM`. Prompts 5 and 6 reject empty values,
-since an empty author identity produces commits git will not attribute.
+Dates are validated as `YYYY-MM-DD` and re-asked on bad input; the offset as
+`±HH:MM`. Name, email, and directory reject empty values, since an empty author
+identity produces commits git will not attribute.
 
-## Fetch
+The existing-directory check runs immediately after prompt 7, before the summary,
+so a run that will be refused is refused before the user confirms it.
 
-1. `GET /user` → `login`. A non-200 here means a bad token; report and exit.
-2. Paginate `GET /user/repos?affiliation=owner,collaborator,organization_member&per_page=100`,
-   following the `Link: rel="next"` header, collecting `full_name` and `pushed_at`.
-3. Drop any repo whose `pushed_at` is earlier than the since date. This prunes
-   most of the list for free and is the main cost saving.
-4. For each surviving repo, paginate
-   `GET /repos/{full_name}/commits?author={login}&since={since}&until={until}&per_page=100`.
-   The `author` parameter matches by login or email, so it returns only the
-   user's own commits. Treat `409` (empty repository) and `404` (access lost
-   between listing and reading) as "no commits" and continue.
-5. Dedupe by SHA — the same commit is reachable through forks and mirrors.
-6. Sort ascending by date and write `commits.json`.
+## Fetching the calendar
 
-No fork filtering. `?author={login}` already restricts results to the user's
-own commits, so upstream history in a fork is excluded and the user's own
-commits in a fork are kept.
+`GITHUB_TOKEN` or the prompt supplies the token. The token needs `read:user`, and
+`repo` for private-repository contributions to be counted.
 
-### Pull request commits
+1. The requested range is split into windows of at most 364 days, since
+   `contributionsCollection` accepts at most one year per query. Windows are
+   contiguous: each begins one second after the previous ends.
+2. Each window is one POST to `https://api.github.com/graphql` requesting
+   `viewer { login, contributionsCollection { restrictedContributionsCount,
+   contributionCalendar { totalContributions, weeks { contributionDays { date,
+   contributionCount } } } } }`.
+3. Days with a zero count are dropped, as are dates outside the requested range —
+   the calendar is week-aligned and so overhangs both ends.
+4. A date appearing in two adjacent windows is taken once, not summed: the count is
+   a property of the day, not of the window. Adding them would inflate the replica.
+5. Days are returned sorted ascending by date.
 
-Default-branch collection alone misses the commits that matter most on a
-squash-merging team. A squash merge leaves exactly one commit on the default
-branch, dated at merge time, while the commits the author actually wrote — and
-their real timestamps — exist only on the pull request. Commits on open or
-unmerged PR branches are likewise absent from the default branch.
+`restrictedContributionsCount` is reported when non-zero, since it means
+contributions were counted in private repositories the token cannot see in detail —
+usually a missing `repo` scope.
 
-So a second pass always runs, and its results are merged with the first and
-deduplicated by SHA:
+### Error handling
 
-1. `GET /search/issues?q=is:pr involves:{login} updated:>={since}` enumerates the
-   pull requests, following `Link` pagination and stopping at the endpoint's
-   1000-result ceiling rather than trusting a `Link` header past it. `updated:>=`
-   rather than `created:` is the correct prune: a PR holding an in-range commit
-   must have been updated at or after that commit. `involves:` rather than
-   `author:` because a teammate frequently opens the PR that carries the user's
-   commits on a shared branch; per-PR precision is not the goal, since step 3
-   narrows per commit.
-2. `GET /repos/{full_name}/pulls/{number}/commits` reads each PR's commits. This
-   endpoint keeps serving them after the PR branch is deleted, which is what
-   makes squash-merged history recoverable at all.
-3. Commits are kept only where the author date falls in range — the search prune
-   is deliberately looser than the window — and only where the commit is the
-   user's own.
+GraphQL reports failures inside a 200 response body, so an unchecked `errors` array
+would read as "no contributions" — the silent wrongness this tool can least afford.
+Both a non-ok status and a non-empty `errors` array throw with the message.
 
-Establishing "the user's own" is the subtle part, and the one place the tool can
-silently under-report. GitHub resolves a commit's `author` field by matching its
-git email against emails verified on an account, so `author` is null whenever the
-email belongs to no account — indistinguishable from a colleague's commit by
-login alone. The default-branch pass cannot supply the missing emails either: its
-server-side `?author={login}` filter only matches emails that are already linked,
-so deriving a known-email set from its results is circular and buys nothing.
+Rate limiting needs no special handling: a decade of history is ten queries.
 
-The tool therefore asks the account directly: `GET /user/emails` (requires
-`user:email` scope) yields the verified set, and a commit counts as the user's
-when either its `author.login` matches or its git email is in that set, compared
-case-insensitively. When the scope is absent the call fails soft to an empty set
-with a warning. Any commit that is skipped because its email matched nothing is
-counted per email address and reported at the end of the pass, so an
-under-reported history is visible rather than silent.
-
-A failure anywhere in this pass is caught: the default-branch commits already
-collected are cached with a warning rather than discarded, because that pass can
-cost thousands of requests and the cache is written only once.
-
-Two limits of the search endpoint are surfaced rather than worked around: it
-returns at most 1000 results, and it permits 30 requests per minute against the
-5000 per hour the rest of the tool uses. Pagination halts at 1000 collected
-results and prints a warning telling the user to narrow the range — halting is
-what keeps a rejected request past the ceiling from throwing away the
-default-branch work. The rate limit is absorbed by the existing retry, so a large
-fetch is slower but not wrong.
-
-Not collected: commits on a non-default branch that never became a pull request,
-and non-commit contributions — PRs opened, reviews, issues — which GitHub counts
-on the graph but which no commit replica can reproduce.
-
-### Rate limiting
-
-When a response reports the limit exhausted — status `403` or `429` with
-`X-RateLimit-Remaining: 0` — sleep until the epoch second in
-`X-RateLimit-Reset` (plus one second) and retry the same request. Reacting to
-the rejection rather than pre-emptively sleeping on `remaining: 0` avoids
-stalling for an hour after the final request of a run. No exponential backoff,
-no retry library.
-
-### commits.json
+### contributions.json
 
 ```json
-[{ "sha": "a1b2c3d…", "repo": "org/name", "date": "2024-03-11T09:22:07Z" }]
+[{ "date": "2026-09-01", "count": 22 }]
 ```
 
-Dates are exactly as GitHub returns them: ISO 8601 normalized to UTC.
+If the file exists, the tool reports its total, its date range and its modification
+time, and asks whether to reuse it instead of calling the API.
 
-If `commits.json` already exists, the tool reports its commit count and
-modification time and asks whether to reuse it instead of calling the API.
+## Synthesising commits
 
-## Timezone handling
+Each day of count *N* becomes *N* entries. Entry *i* is placed at minute
+`9*60 + floor(i * 13*60 / N)` of that date in the chosen offset — evenly spread
+across 09:00–22:00 local, so even a day holding hundreds of contributions cannot
+spill past midnight onto the next square. Beyond about 780 in one day the minutes
+repeat, which git accepts.
 
-Both `GET /repos/{o}/{r}/commits` and `GET /repos/{o}/{r}/git/commits/{sha}`
-return author dates normalized to UTC (`…Z`). The commit's original UTC offset
-is not exposed by the REST API and cannot be recovered from it.
+An entry stores the **UTC instant** whose local time in the chosen offset is that
+minute of that date. Replay then converts it back with the same offset, so the
+commit lands on exactly the intended calendar day. The stored form is UTC purely so
+that the replay path is identical to reading a UTC timestamp from an API.
 
-This matters because GitHub places a commit on the contribution graph using the
-author date's local day. Replaying a `22:00 UTC` timestamp as UTC puts it on a
-different calendar square than the `+05:00` day it was actually authored on.
+Because the calendar supplies dates directly, no timezone conversion can move a
+contribution onto the wrong square. The offset decides only what local time the
+commits carry — which is why it is no longer described as "the zone you did the work
+in".
 
-The tool therefore converts each UTC timestamp to the offset from prompt 4 and
-writes that offset into the replayed commit. With the offset set to the zone the
-work was actually done in, calendar days match. Commits authored in a different
-zone than the chosen offset may land one day off. This is a known and accepted
-limit, not a bug to fix later — the API does not carry the information needed to
-do better.
-
-Separately, the `since`/`until` fetch filter (see Fetch, step 4) keys off the
-commit's **committer** date, the same way `git log --since/--until` does, while
-this tool stores and replays `commit.author.date`. On rebased, cherry-picked, or
-imported history the two dates diverge, so the requested date range is only
-approximate for that history: a commit with a recent committer date but an old
-author date can be pulled in, and one authored in range whose committer date
-predates it can be dropped. Normal, non-rewritten history is unaffected since the
-two dates usually match. The query stays as-is — filtering client-side would mean
-fetching a much larger range to catch the same edge case, which costs more than
-the rare inaccuracy it would fix.
+Entry ids are `YYYY-MM-DD#i`, which become commit messages of the form
+`contribution 2026-09-01#7`. The replica is not disguised.
 
 ## Replay
 
-Refuse to proceed if the output directory already exists, rather than appending
-a second copy of the history. Report the path and exit.
+Refuse to proceed if the output directory already exists, rather than appending a
+second copy of the history. Report the path and exit.
 
 ```
 git init -q -b main -- <outdir>
 ```
 
-Then, per commit, in date order:
+Then, per entry, in date order:
 
 ```
 GIT_AUTHOR_NAME=<name>  GIT_AUTHOR_EMAIL=<email>  GIT_AUTHOR_DATE=<iso+offset>
 GIT_COMMITTER_NAME=<name> GIT_COMMITTER_EMAIL=<email> GIT_COMMITTER_DATE=<iso+offset>
-git -c commit.gpgsign=false -c core.hooksPath=/dev/null \
-  commit --allow-empty -q -m "sync <sha[0:7]>"
+git -C <outdir> -c commit.gpgsign=false -c core.hooksPath=/dev/null \
+  commit --allow-empty -q -m "contribution <id>"
 ```
 
 Author and committer dates are both set: GitHub's contribution graph reads the
-author date, but leaving the committer date at "now" makes every commit's
-metadata visibly inconsistent.
+author date, but leaving the committer date at "now" makes every commit's metadata
+visibly inconsistent. The two `-c` flags keep the replay independent of the user's
+global git config — `commit.gpgsign=true` would otherwise launch pinentry with no
+TTY once per commit, and a global hook would run arbitrary code once per commit.
 
 Branch `main` is created explicitly because GitHub counts commits only on a
 repository's default branch.
 
 Commits are invoked via `execFileSync` with an argument array — never a shell
-string — so commit messages and identity values cannot inject shell syntax.
+string — so identity values cannot inject shell syntax.
 
-Progress is reported as a counter every 100 commits; a multi-thousand-commit
-replay otherwise looks hung.
+Progress is reported every 100 commits; a multi-thousand-commit replay otherwise
+looks hung.
 
 ### Script mode
 
-When prompt 8 selects script output, the same commands are written to
-`replay.sh` instead of being executed: a `set -e` header, the `git init`, one
-`git commit` line per commit with its dates inline, and a closing `echo`
-reporting the commit count. The script is not made executable and is not run;
-the tool prints `bash replay.sh` as the next step, and the `git push`
-instructions are left to that later run rather than baked into the script.
+When prompt 8 selects script output, the same commands are written to `replay.sh`
+instead of being executed: a `set -e` header, a `test -e` guard that exits non-zero
+if the output directory exists, the `git init`, one `git commit` line per entry with
+its dates inline, and a closing `echo` reporting the count. The guard matters
+because `git init` on an existing repository succeeds silently, so without it a
+second `bash replay.sh` would double every commit and exit 0.
 
-Values interpolated into `replay.sh` are single-quoted with embedded single
-quotes escaped.
+The output directory is resolved to an absolute path before rendering, since
+`replay.sh` is written to the current directory but may be run from elsewhere.
 
-## Completion
-
-Print the number of commits created, the output path, and:
-
-```
-cd <outdir>
-git remote add origin git@github.com:<you>/<repo>.git
-git push -u origin main
-```
+Values interpolated into `replay.sh` are single-quoted with embedded single quotes
+escaped, without exception.
 
 ## Failure modes
 
 | Condition | Behaviour |
 |-----------|-----------|
-| Bad or expired token (`GET /user` ≠ 200) | Report status, exit non-zero |
-| Repo returns 409 / 404 | Skip repo, continue |
-| Rate limit exhausted | Sleep to reset, retry same request |
-| Network error mid-fetch | Propagate; `commits.json` is not written, so nothing is half-cached |
+| Bad or expired token | GraphQL returns 401, or `errors` names it; throw, exit non-zero |
+| Missing scope | Calendar total is low and/or `restrictedContributionsCount` is non-zero; reported, not fatal |
+| `errors` array in a 200 response | Throw with the joined messages — never treated as zero contributions |
+| Reversed date range | Throw before any request |
+| Network error mid-fetch | Propagate; `contributions.json` is not written, so nothing is half-cached |
 | Output directory exists | Refuse, exit non-zero, write nothing |
-| Zero commits in range | Report and exit before creating any repo |
+| Zero contributions in range | Report and exit before creating any repo |
+| Ctrl-D at any prompt | Abort cleanly with "cancelled, nothing written" |
 | `git` not on PATH | Propagate the `execFileSync` error |
 
 ## Verification
 
 `test.ts`, run via `node --test test.ts`.
 
-One test covers the only logic that can fail silently: a fixture of three
-commits with known UTC timestamps is generated into a temporary directory, and
-`git log --format=%aI` in the resulting repo must equal the expected
-offset-converted timestamps exactly, in order, including offsets. A drift in
-timezone conversion or date formatting fails this test.
-
-A second, cheaper assertion checks that the replay refuses an existing output
-directory.
+The load-bearing test is the invariant that every synthesised entry lands on its own
+calendar day, checked across `+00:00`, `+05:00`, `+05:30`, `-08:00`, `+14:00` and
+`-11:00`, including a 300-contribution day. Alongside it, two tests read real git
+objects back out of a temporary repository: one asserting a fixture's author dates
+and local days exactly, including a commit that crosses the day boundary, and one
+asserting that 22 counted contributions produce 22 commits all on the same square.
+The generated script is executed with bash and its author dates compared against the
+direct replay. Quoting, the script's guard line, the existing-directory refusal, and
+the calendar's window-splitting, zero-day filtering and cross-window de-duplication
+each have their own test.
 
 ## Deliberately skipped
 
@@ -273,7 +226,18 @@ directory.
 |---------|----------|
 | CLI flags | Re-running the same prompts becomes tedious |
 | Config file | Flags exist and are still tedious |
-| Fetch resume | A real fetch dies mid-run |
+| Replay resume | A real replay dies mid-run |
 | Auto-push, remote creation | Manual push proves annoying rather than reassuring |
-| Per-repo or per-org filtering | An unwanted repo's commits actually pollute the result |
-| Non-empty commits, real diffs | Empty commits turn out not to register |
+| Realistic per-commit times | Someone actually reads the replica's log and cares |
+
+## History
+
+The first implementation of this design walked every accessible repository's default
+branch via the REST commits API, and later also collected the commits inside pull
+requests to recover squash-merged work. Both passes were removed once the goal was
+stated as replicating the contribution graph rather than the commit history: the
+graph counts activity the commit log does not contain (PRs opened, reviews, issues,
+repositories created), and the commit log contains work the graph never counted
+(commits on branches that were squashed away). The GraphQL calendar is both smaller
+and correct. The commit-scanning code, its rate-limit retry, its Link-header
+pagination and its identity-matching heuristics are all gone.

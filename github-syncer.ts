@@ -5,14 +5,17 @@ import { stdin, stdout } from "node:process";
 import { resolve } from "node:path";
 
 export function toOffset(utcIso: string, offset: string): string {
-  const m = /^([+-])(\d{2}):(\d{2})$/.exec(offset);
-  if (!m) throw new Error(`bad offset: ${offset}`);
+  const minutes = offsetMinutes(offset);
   const ms = Date.parse(utcIso);
   if (Number.isNaN(ms)) throw new Error(`bad date: ${utcIso}`);
-  const sign = m[1] === "-" ? -1 : 1;
-  const minutes = sign * (Number(m[2]) * 60 + Number(m[3]));
   const shifted = new Date(ms + minutes * 60_000);
   return shifted.toISOString().slice(0, 19) + offset;
+}
+
+export function offsetMinutes(offset: string): number {
+  const m = /^([+-])(\d{2}):(\d{2})$/.exec(offset);
+  if (!m) throw new Error(`bad offset: ${offset}`);
+  return (m[1] === "-" ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3]));
 }
 
 export function localOffset(d: Date = new Date()): string {
@@ -31,262 +34,155 @@ export const isOffset = (s: string): boolean => /^[+-]\d{2}:\d{2}$/.test(s);
 
 export type Fetcher = (url: string, init?: RequestInit) => Promise<Response>;
 
-const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-export function nextLink(header: string | null): string | null {
-  if (!header) return null;
-  const m = /<([^>]+)>;\s*rel="next"/.exec(header);
-  return m ? m[1] : null;
+/** One day of the contribution calendar: the date, and how many contributions it holds. */
+export interface Day {
+  date: string;
+  count: number;
 }
 
-export async function ghGet(
-  url: string,
-  token: string,
-  f: Fetcher = fetch,
-  sleep: (ms: number) => Promise<void> = realSleep,
-): Promise<Response> {
-  for (; ;) {
-    const res = await f(url, {
-      headers: {
-        authorization: `Bearer ${token}`,
-        accept: "application/vnd.github+json",
-        "x-github-api-version": "2022-11-28",
-        "user-agent": "github-syncer",
-      },
-    });
-    const exhausted =
-      (res.status === 403 || res.status === 429) && res.headers.get("x-ratelimit-remaining") === "0";
-    if (!exhausted) return res;
-    const resetSec = Number(res.headers.get("x-ratelimit-reset"));
-    const wait = Number.isFinite(resetSec)
-      ? Math.max(1_000, resetSec * 1_000 - Date.now() + 1_000)
-      : 60_000;
-    console.error(`rate limit hit, sleeping ${Math.round(wait / 1000)}s`);
-    await sleep(wait);
-  }
-}
-
-export async function paginate<T>(url: string, token: string, f: Fetcher = fetch): Promise<T[]> {
-  const out: T[] = [];
-  let next: string | null = url;
-  // ponytail: no cycle guard. GitHub generates these Link headers, so a
-  // self-referential `next` would be its bug; add a visited-set if this
-  // ever talks to another API.
-  while (next) {
-    const res = await ghGet(next, token, f);
-    // 409 = empty repo, 404 = access lost between listing and reading. Neither is fatal,
-    // but only on the first page — a 404/409 after we already have results means access
-    // was lost mid-pagination, and returning what we have so far would silently truncate.
-    if ((res.status === 409 || res.status === 404) && out.length === 0) return out;
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${next}`);
-    out.push(...((await res.json()) as T[]));
-    next = nextLink(res.headers.get("link"));
-  }
-  return out;
-}
-
-export interface Repo {
-  full_name: string;
-  pushed_at: string | null;
-}
-
-export interface ApiCommit {
-  sha: string;
-  commit: { author: { date: string; email?: string } | null };
-}
-
-export interface Commit {
-  sha: string;
-  repo: string;
+/** One commit to replay: a label for its message, and the UTC instant to stamp it with. */
+export interface Entry {
+  id: string;
   date: string;
 }
 
-const API = "https://api.github.com";
+const GRAPHQL = "https://api.github.com/graphql";
 
-// whoAmI runs once per collector, but the scope warning is about the token, not the call.
-let scopesWarned = false;
-
-// pushed_at and `since` are both ISO-prefixed, so a string compare is a date compare.
-export function activeRepos(repos: Repo[], since: string): Repo[] {
-  return repos.filter((r) => !r.pushed_at || r.pushed_at >= since);
-}
-
-export function dedupeSort(commits: Commit[]): Commit[] {
-  const seen = new Map<string, Commit>();
-  for (const c of commits) if (!seen.has(c.sha)) seen.set(c.sha, c);
-  return [...seen.values()].sort((a, b) => a.date.localeCompare(b.date));
-}
-
-export async function whoAmI(token: string, f: Fetcher = fetch): Promise<string> {
-  const res = await ghGet(`${API}/user`, token, f);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText} — token rejected by GET /user`);
-  if (!scopesWarned) {
-    scopesWarned = true;
-    const scopes = res.headers.get("x-oauth-scopes");
-    if (scopes) {
-      if (!scopes.split(",").map((s) => s.trim()).includes("repo")) {
-        console.error(
-          "warning: this token's scopes do not include `repo` — private repositories will be invisible to it, so the replica will be incomplete.",
-        );
+// The contribution calendar IS the graph, so it already counts every activity GitHub
+// counts — commits, PRs opened, reviews submitted, issues and discussions opened,
+// repositories created and forked. Summing REST endpoints could not match it: a commit
+// counts only on a default or gh-pages branch of a non-fork, so squash-merged PR branch
+// commits were never on the source graph and must not be replicated.
+const CALENDAR_QUERY = `query($from: DateTime!, $to: DateTime!) {
+  viewer {
+    login
+    contributionsCollection(from: $from, to: $to) {
+      restrictedContributionsCount
+      contributionCalendar {
+        totalContributions
+        weeks { contributionDays { date contributionCount } }
       }
-    } else {
-      console.error(
-        "warning: token scopes could not be verified (fine-grained tokens don't report them) — confirm this token can read your private repos.",
-      );
     }
   }
-  return ((await res.json()) as { login: string }).login;
+}`;
+
+interface CalendarBody {
+  data?: {
+    viewer: {
+      login: string;
+      contributionsCollection: {
+        restrictedContributionsCount: number;
+        contributionCalendar: {
+          totalContributions: number;
+          weeks: { contributionDays: { date: string; contributionCount: number }[] }[];
+        };
+      };
+    };
+  };
+  errors?: { message: string }[];
 }
 
-export async function collectCommits(
+export async function ghGraphQL(
+  query: string,
+  variables: Record<string, string>,
   token: string,
-  since: string,
-  until: string,
   f: Fetcher = fetch,
-): Promise<Commit[]> {
-  const login = await whoAmI(token, f);
-  const repos = await paginate<Repo>(
-    `${API}/user/repos?affiliation=owner,collaborator,organization_member&per_page=100`,
-    token,
-    f,
-  );
-  const live = activeRepos(repos, since);
-  console.log(`${repos.length} repos accessible, ${live.length} touched since ${since}`);
-
-  // ponytail: repos are walked serially. Fine at a few hundred repos; parallelise
-  // with a small concurrency pool if a fetch ever takes long enough to care about.
-  const out: Commit[] = [];
-  for (const [i, repo] of live.entries()) {
-    const q = new URLSearchParams({
-      author: login,
-      since: `${since}T00:00:00Z`,
-      until: `${until}T23:59:59Z`,
-      per_page: "100",
-    });
-    const commits = await paginate<ApiCommit>(`${API}/repos/${repo.full_name}/commits?${q}`, token, f);
-    for (const c of commits) {
-      if (!c.commit.author?.date) continue;
-      out.push({ sha: c.sha, repo: repo.full_name, date: c.commit.author.date });
-    }
-    console.log(`  [${i + 1}/${live.length}] ${repo.full_name}: ${commits.length}`);
-  }
-  return dedupeSort(out);
-}
-
-export interface PrApiCommit extends ApiCommit {
-  author: { login: string } | null;
-}
-
-export interface PrRef {
-  repo: string;
-  number: number;
-}
-
-interface SearchItem {
-  number: number;
-  repository_url: string;
-}
-
-// Squash-merged PRs leave one commit on the default branch, dated at merge time, so the
-// commits the author actually wrote — and their real dates — survive only on the PR itself.
-// /pulls/{n}/commits still serves them after the branch is deleted, which is what makes
-// this recoverable at all.
-// GitHub resolves a commit's `author` field by matching its git email against emails
-// verified on an account, so `author` is null whenever the email is linked to nobody —
-// indistinguishable from a colleague's commit by login alone. Asking the account which
-// emails are its own is the only non-circular way to tell the two apart: the default-branch
-// pass cannot supply them, since ?author=<login> already only matches linked emails.
-export async function myEmails(token: string, f: Fetcher = fetch): Promise<Set<string>> {
-  const res = await ghGet(`${API}/user/emails?per_page=100`, token, f);
+): Promise<CalendarBody> {
+  const res = await f(GRAPHQL, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      "user-agent": "github-syncer",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
   if (!res.ok) {
-    console.error(
-      `warning: could not read your verified emails (${res.status}) — the token lacks \`user:email\` scope. ` +
-        "Commits authored under an email that is not linked to your account cannot be told apart from a colleague's and will be skipped.",
-    );
-    return new Set();
+    throw new Error(`${res.status} ${res.statusText} from the GraphQL API — check the token and its scopes`);
   }
-  const emails = (await res.json()) as { email: string }[];
-  return new Set(emails.map((e) => e.email.toLowerCase()));
+  const body = (await res.json()) as CalendarBody;
+  // GraphQL reports failures inside a 200 response, so an unchecked errors array would
+  // read as "no contributions" — the silent wrongness this tool can least afford.
+  if (body.errors?.length) throw new Error(`GraphQL: ${body.errors.map((e) => e.message).join("; ")}`);
+  if (!body.data) throw new Error("GraphQL returned no data and no errors");
+  return body;
 }
 
-async function searchPrs(token: string, login: string, since: string, f: Fetcher = fetch): Promise<PrRef[]> {
-// involves: rather than author: — on a shared branch a teammate often opens the PR that
-// carries your commits, and the per-commit filter below is what actually narrows to you.
-// The cost is more PRs to walk, not less accuracy.
-  const q = `is:pr involves:${login} updated:>=${since}`;
-  let next: string | null = `${API}/search/issues?q=${encodeURIComponent(q)}&per_page=100`;
-  const out: PrRef[] = [];
-  let capWarned = false;
-  while (next) {
-    const res = await ghGet(next, token, f);
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${next}`);
-    const page = (await res.json()) as { total_count: number; items: SearchItem[] };
-    if (!capWarned && page.total_count > 1000) {
-      capWarned = true;
-      console.error(
-        `warning: ${page.total_count} pull requests match but the search API returns at most 1000 — narrow the date range to reach the rest.`,
-      );
-    }
-    for (const item of page.items) {
-      out.push({ repo: item.repository_url.replace(`${API}/repos/`, ""), number: item.number });
-    }
-    // Stop at the documented ceiling rather than trusting the Link header past it —
-    // requests beyond 1000 results are rejected, and a throw here would discard the
-    // default-branch commits already collected.
-    next = out.length >= 1000 ? null : nextLink(res.headers.get("link"));
+/**
+ * contributionsCollection accepts at most one year per query, so a longer range is walked
+ * in windows. 364 days keeps each window strictly inside the cap.
+ */
+export function yearWindows(since: string, until: string): { from: string; to: string }[] {
+  const start = Date.parse(`${since}T00:00:00Z`);
+  const end = Date.parse(`${until}T23:59:59Z`);
+  if (Number.isNaN(start) || Number.isNaN(end)) throw new Error(`bad range: ${since}..${until}`);
+  if (start > end) throw new Error(`since ${since} is after until ${until}`);
+  const WINDOW = 364 * 86_400_000;
+  const out: { from: string; to: string }[] = [];
+  for (let from = start; from <= end; ) {
+    const to = Math.min(from + WINDOW, end);
+    out.push({ from: new Date(from).toISOString(), to: new Date(to).toISOString() });
+    from = to + 1000;
   }
   return out;
 }
 
-export async function collectPrCommits(
+export async function fetchCalendar(
   token: string,
   since: string,
   until: string,
   f: Fetcher = fetch,
-): Promise<Commit[]> {
-  const login = await whoAmI(token, f);
-  const emails = await myEmails(token, f);
-  const prs = await searchPrs(token, login, since, f);
-  console.log(`${prs.length} pull requests involving ${login}, updated since ${since}`);
-
-  const from = `${since}T00:00:00Z`;
-  const to = `${until}T23:59:59Z`;
-  // ponytail: PRs are walked serially, and the search API's 30-requests-per-minute
-  // limit is absorbed reactively by ghGet's retry rather than paced up front. Add
-  // pacing if a large history ends up spending most of its time asleep.
-  const out: Commit[] = [];
-  const unmatched = new Map<string, number>();
-  for (const [i, pr] of prs.entries()) {
-    const commits = await paginate<PrApiCommit>(
-      `${API}/repos/${pr.repo}/pulls/${pr.number}/commits?per_page=100`,
-      token,
-      f,
-    );
-    let mine = 0;
-    for (const c of commits) {
-      const date = c.commit.author?.date;
-      if (!date || date < from || date > to) continue;
-      // A shared PR branch carries other people's commits too, so narrow to this user —
-      // by matched account when GitHub resolved one, otherwise by the commit's own email.
-      const email = c.commit.author?.email?.toLowerCase();
-      if (c.author?.login === login || (email && emails.has(email))) {
-        out.push({ sha: c.sha, repo: pr.repo, date });
-        mine++;
-      } else if (!c.author && email) {
-        unmatched.set(email, (unmatched.get(email) ?? 0) + 1);
+): Promise<Day[]> {
+  const byDate = new Map<string, number>();
+  let login = "";
+  let restricted = 0;
+  for (const window of yearWindows(since, until)) {
+    const { viewer } = (await ghGraphQL(CALENDAR_QUERY, window, token, f)).data!;
+    login = viewer.login;
+    restricted += viewer.contributionsCollection.restrictedContributionsCount;
+    for (const week of viewer.contributionsCollection.contributionCalendar.weeks) {
+      for (const day of week.contributionDays) {
+        if (day.contributionCount === 0) continue;
+        if (day.date < since || day.date > until) continue;
+        // A date can appear in two adjacent windows. Its count is a property of the day,
+        // not of the window, so take it once rather than adding it twice.
+        byDate.set(day.date, Math.max(byDate.get(day.date) ?? 0, day.contributionCount));
       }
     }
-    console.log(`  [${i + 1}/${prs.length}] ${pr.repo}#${pr.number}: ${mine}`);
   }
-  // Never let a skipped commit be invisible — this is the one place the tool can quietly
-  // under-report the user's own history, so it names the emails it could not attribute.
-  for (const [email, n] of unmatched) {
-    console.error(
-      `warning: skipped ${n} commit(s) authored as <${email}>, which is not linked to your account. ` +
-        "Add and verify that email on the account, or those commits cannot be attributed to you.",
-    );
+  const days = [...byDate.entries()]
+    .map(([date, count]) => ({ date, count }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const total = days.reduce((n, d) => n + d.count, 0);
+  console.log(`${total} contributions across ${days.length} active days for ${login}`);
+  if (restricted > 0) {
+    console.log(`  ${restricted} are in private repositories this token cannot see in detail`);
+    console.log("  give the token `repo` scope if that number should be zero");
   }
-  return dedupeSort(out);
+  return days;
+}
+
+/**
+ * Turn per-day counts into commits. Each entry is stored as the UTC instant whose local
+ * time in `offset` falls on that calendar date, so replay's toOffset() lands it back on
+ * exactly the square the source graph had it on.
+ */
+export function synthesize(days: Day[], offset: string): Entry[] {
+  const off = offsetMinutes(offset);
+  const out: Entry[] = [];
+  for (const day of days) {
+    const midnight = Date.parse(`${day.date}T00:00:00Z`);
+    if (Number.isNaN(midnight)) throw new Error(`bad date: ${day.date}`);
+    for (let i = 0; i < day.count; i++) {
+      // ponytail: spread evenly across 09:00-22:00 local so even a day holding hundreds of
+      // contributions cannot spill past midnight into the next square. Beyond ~780 in one
+      // day the minutes start repeating, which git accepts; widen the window if it matters.
+      const minute = 9 * 60 + Math.floor((i * 13 * 60) / day.count);
+      const utc = new Date(midnight + (minute - off) * 60_000);
+      out.push({ id: `${day.date}#${i + 1}`, date: `${utc.toISOString().slice(0, 19)}Z` });
+    }
+  }
+  return out;
 }
 
 export interface ReplayOpts {
@@ -316,25 +212,25 @@ export function commitEnv(name: string, email: string, date: string): Record<str
 // and a global hook could run arbitrary code once per commit.
 const SAFE_GIT_CONFIG = ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"];
 
-// ponytail: no resume. A replay that dies partway leaves a partial repo and the
-// only recovery is `rm -rf` and rerun; commits are empty so regenerating is cheap
-// and commits.json is already cached. Add resume if a real replay ever dies.
-export function replay(commits: Commit[], o: ReplayOpts): void {
+// ponytail: no resume. A replay that dies partway leaves a partial repo and the only
+// recovery is `rm -rf` and rerun; commits are empty so regenerating is cheap and the
+// calendar is already cached. Add resume if a real replay ever dies.
+export function replay(entries: Entry[], o: ReplayOpts): void {
   if (existsSync(o.dir)) throw new Error(`${o.dir} already exists — refusing to append to it`);
   execFileSync("git", ["init", "-q", "-b", "main", "--", o.dir]);
   let n = 0;
-  for (const c of commits) {
-    const date = toOffset(c.date, o.offset);
+  for (const e of entries) {
+    const date = toOffset(e.date, o.offset);
     execFileSync(
       "git",
-      ["-C", o.dir, ...SAFE_GIT_CONFIG, "commit", "--allow-empty", "-q", "-m", `sync ${c.sha.slice(0, 7)}`],
+      ["-C", o.dir, ...SAFE_GIT_CONFIG, "commit", "--allow-empty", "-q", "-m", `contribution ${e.id}`],
       { env: { ...process.env, ...commitEnv(o.name, o.email, date) } },
     );
-    if (++n % 100 === 0) console.log(`  ${n}/${commits.length} commits`);
+    if (++n % 100 === 0) console.log(`  ${n}/${entries.length} commits`);
   }
 }
 
-export function renderScript(commits: Commit[], o: ReplayOpts): string {
+export function renderScript(entries: Entry[], o: ReplayOpts): string {
   const lines = [
     "#!/usr/bin/env bash",
     "set -e",
@@ -342,19 +238,19 @@ export function renderScript(commits: Commit[], o: ReplayOpts): string {
     `git init -q -b main -- ${shq(o.dir)}`,
     "",
   ];
-  for (const c of commits) {
-    const date = toOffset(c.date, o.offset);
+  for (const e of entries) {
+    const date = toOffset(e.date, o.offset);
     lines.push(
       `GIT_AUTHOR_NAME=${shq(o.name)} GIT_AUTHOR_EMAIL=${shq(o.email)} GIT_AUTHOR_DATE=${shq(date)} \\`,
       `GIT_COMMITTER_NAME=${shq(o.name)} GIT_COMMITTER_EMAIL=${shq(o.email)} GIT_COMMITTER_DATE=${shq(date)} \\`,
-      `  git -C ${shq(o.dir)} -c commit.gpgsign=false -c core.hooksPath=/dev/null commit --allow-empty -q -m ${shq(`sync ${c.sha.slice(0, 7)}`)}`,
+      `  git -C ${shq(o.dir)} -c commit.gpgsign=false -c core.hooksPath=/dev/null commit --allow-empty -q -m ${shq(`contribution ${e.id}`)}`,
     );
   }
-  lines.push("", `echo ${shq(`created ${commits.length} commits in ${o.dir}`)}`, "");
+  lines.push("", `echo ${shq(`created ${entries.length} commits in ${o.dir}`)}`, "");
   return lines.join("\n");
 }
 
-const CACHE = "commits.json";
+const CACHE = "contributions.json";
 
 function gitConfig(key: string): string {
   try {
@@ -380,7 +276,7 @@ async function askValid(
   ok: (s: string) => boolean,
   signal: AbortSignal,
 ): Promise<string> {
-  for (; ;) {
+  for (;;) {
     const a = await ask(rl, q, signal, def);
     if (ok(a)) return a;
     console.log("  invalid, try again");
@@ -388,7 +284,7 @@ async function askValid(
 }
 
 async function askRequired(rl: Interface, q: string, def: string, signal: AbortSignal): Promise<string> {
-  for (; ;) {
+  for (;;) {
     const a = await ask(rl, q, signal, def);
     if (a) return a;
     console.log("  required");
@@ -407,7 +303,7 @@ async function askSecret(rl: Interface, q: string, signal: AbortSignal): Promise
   const iface = rl as unknown as { _writeToOutput?: (s: string) => void };
   const original = iface._writeToOutput;
   stdout.write(`${q}: `);
-  iface._writeToOutput = () => { };
+  iface._writeToOutput = () => {};
   try {
     const value = (await rl.question("", { signal })).trim();
     stdout.write("\n");
@@ -426,56 +322,47 @@ async function main(): Promise<void> {
   rl.once("close", () => ac.abort());
   const { signal } = ac;
   try {
-    console.log("github-syncer — replicate one account's commit history as empty commits\n");
+    console.log("github-syncer — replicate one account's contribution graph as empty commits\n");
 
     const token = process.env.GITHUB_TOKEN || (await askSecret(rl, "Source GitHub token", signal));
     if (!token) throw new Error("a token is required");
 
-    let commits: Commit[] | null = null;
+    let days: Day[] | null = null;
     if (existsSync(CACHE)) {
-      const cached = JSON.parse(readFileSync(CACHE, "utf8")) as Commit[];
+      const cached = JSON.parse(readFileSync(CACHE, "utf8")) as Day[];
       const when = statSync(CACHE).mtime.toISOString().slice(0, 16).replace("T", " ");
-      const range =
-        cached.length > 0 ? `, ${cached[0].date.slice(0, 10)}..${cached.at(-1)!.date.slice(0, 10)}` : "";
+      const cachedTotal = cached.reduce((n, d) => n + d.count, 0);
+      const range = cached.length > 0 ? `, ${cached[0].date}..${cached.at(-1)!.date}` : "";
       if (
-        await askYes(rl, `Reuse ${CACHE} (${cached.length} commits${range}, fetched ${when})?`, true, signal)
+        await askYes(
+          rl,
+          `Reuse ${CACHE} (${cachedTotal} contributions${range}, fetched ${when})?`,
+          true,
+          signal,
+        )
       ) {
-        commits = cached;
+        days = cached;
       }
     }
 
-    if (!commits) {
+    if (!days) {
       const since = await askValid(rl, "Since date (YYYY-MM-DD)", isoDaysAgo(365), isDate, signal);
       const until = await askValid(rl, "Until date (YYYY-MM-DD)", isoDaysAgo(0), isDate, signal);
-      console.log("\nfetching default-branch commits...");
-      const onBranch = await collectCommits(token, since, until);
-      console.log("\nfetching pull request commits...");
-      // A PR-phase failure must not discard the default-branch commits already in hand —
-      // that pass can be thousands of requests, and the cache is only written once below.
-      let inPrs: Commit[] = [];
-      try {
-        inPrs = await collectPrCommits(token, since, until);
-      } catch (err) {
-        console.error(`\nwarning: pull request commits failed (${(err as Error).message})`);
-        console.error("keeping the default-branch commits — rerun to retry the PR pass.");
-      }
-      commits = dedupeSort([...onBranch, ...inPrs]);
-      writeFileSync(CACHE, `${JSON.stringify(commits, null, 2)}\n`);
-      const overlap = onBranch.length + inPrs.length - commits.length;
-      console.log(
-        `\ncached ${commits.length} commits to ${CACHE} ` +
-          `(${onBranch.length} on default branches, ${inPrs.length} in PRs, ${overlap} in both)`,
-      );
+      console.log("\nfetching contribution calendar...");
+      days = await fetchCalendar(token, since, until);
+      writeFileSync(CACHE, `${JSON.stringify(days, null, 2)}\n`);
+      console.log(`cached ${days.length} active days to ${CACHE}`);
     }
 
-    if (commits.length === 0) {
-      console.log("no commits in that range — nothing to do");
+    const total = days.reduce((n, d) => n + d.count, 0);
+    if (total === 0) {
+      console.log("no contributions in that range — nothing to do");
       return;
     }
 
     const offset = await askValid(
       rl,
-      "Replay timezone offset (the zone you did the work in)",
+      "Timezone offset to stamp the commits with",
       localOffset(),
       isOffset,
       signal,
@@ -492,11 +379,15 @@ async function main(): Promise<void> {
     const commitNow = await askYes(rl, "Commit now? (n = only write replay.sh)", true, signal);
 
     const opts: ReplayOpts = { dir, name, email, offset };
+    const entries = synthesize(days, offset);
+    const busiest = days.reduce((a, b) => (b.count > a.count ? b : a));
     console.log("\n--- summary ---");
-    console.log(`commits:  ${commits.length}`);
-    console.log(`range:    ${toOffset(commits[0].date, offset)} .. ${toOffset(commits.at(-1)!.date, offset)}`);
-    console.log(`identity: ${name} <${email}>`);
-    console.log(`target:   ${dir}${commitNow ? "" : "  (via replay.sh)"}`);
+    console.log(`contributions: ${total}  (one empty commit each)`);
+    console.log(`active days:   ${days.length}`);
+    console.log(`range:         ${days[0].date} .. ${days.at(-1)!.date}`);
+    console.log(`busiest day:   ${busiest.date} (${busiest.count})`);
+    console.log(`identity:      ${name} <${email}>`);
+    console.log(`target:        ${dir}${commitNow ? "" : "  (via replay.sh)"}`);
     console.log("---------------\n");
     if (!(await askYes(rl, "Proceed?", false, signal))) {
       console.log("aborted, nothing written");
@@ -504,13 +395,13 @@ async function main(): Promise<void> {
     }
 
     if (commitNow) {
-      replay(commits, opts);
-      console.log(`\ncreated ${commits.length} commits in ${dir}`);
+      replay(entries, opts);
+      console.log(`\ncreated ${entries.length} commits in ${dir}`);
     } else {
       // replay.sh is always written to the cwd, but `dir` may be relative — resolve it
       // now so the script builds the replica in the right place even if `bash replay.sh`
       // is later run from a different directory.
-      writeFileSync("replay.sh", renderScript(commits, { ...opts, dir: resolve(dir) }));
+      writeFileSync("replay.sh", renderScript(entries, { ...opts, dir: resolve(dir) }));
       console.log(`\nwrote replay.sh — review it, then: bash replay.sh`);
       return;
     }

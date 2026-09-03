@@ -1,10 +1,10 @@
 # github-syncer
 
-Reads one GitHub account's commit history via the API — commits on default
-branches *and* the commits inside your pull requests — and rebuilds it as
-backdated empty commits in a fresh local repo under a different author identity.
-Push the result and the source account's activity — private repos included —
-shows up on the destination account's contribution graph.
+Reads one GitHub account's **contribution graph** via the GraphQL API and rebuilds
+it as backdated empty commits in a fresh local repo under a different author
+identity. If the source account shows 22 contributions on 1 September, the replica
+gets 22 commits dated 1 September. Push it and the destination profile's graph
+matches the source's, square for square.
 
 For consolidating your own activity (work account → personal profile). Not for
 claiming work you didn't do.
@@ -19,59 +19,60 @@ destination author name and email, which have no default and re-ask until answer
 if `git config user.name`/`user.email` are unset.
 
 Provide the source token via `GITHUB_TOKEN` to skip the token prompt. The token
-needs `repo` scope to see private repositories, and `user:email` so commits
-authored under your other verified emails can be attributed to you.
+needs `read:user` for the calendar, and `repo` for contributions in private
+repositories to be counted.
 
 At the end you choose whether to commit the replica immediately or write a
 `replay.sh` script to run later — review it first, since it contains the full
 replayed history as shell commands.
 
-If a previous run's `commits.json` is present, you're offered a chance to reuse
-it (with its commit count and date range shown) instead of re-hitting the API.
+If a previous run's `contributions.json` is present, you're offered a chance to
+reuse it (with its total and date range shown) instead of re-hitting the API.
+
+## Why the contribution graph, not the commit log
+
+The graph counts more than commits: opening an issue, opening a pull request,
+submitting a PR review, opening or answering a discussion, and creating or forking
+a repository all count, per [GitHub's contributions
+reference](https://docs.github.com/en/account-and-profile/reference/profile-contributions-reference).
+Merging a PR is *not* a contribution in itself — it counts through the merge commit
+and through having opened the PR.
+
+Reconstructing that total by summing REST endpoints cannot work, and the near miss
+is instructive: a commit counts only on a **default or `gh-pages` branch of a
+non-fork** repo. So the individual commits behind a squash-merged PR were never on
+the source graph at all — only the single squash commit was. Collecting them, which
+an earlier version of this tool did, *over*-counts you.
+
+The GraphQL contribution calendar is the graph itself, so it needs one query per
+year and is right by construction:
+
+```graphql
+viewer { contributionsCollection(from: "…", to: "…") {
+  contributionCalendar { totalContributions weeks { contributionDays { date contributionCount } } } } }
+```
 
 ## Notes
 
 - The destination email must be **verified on the destination account**, or the
-  commits are attributed to nobody.
+  commits are attributed to nobody and the graph stays empty.
 - GitHub counts commits on the default branch only, so the replica is built on `main`.
-- Two sources are always fetched and merged, deduplicated by SHA. First every
-  accessible repo's default branch. Then every pull request that **involves** you,
-  via `/pulls/{n}/commits` — the only way to recover the commits behind a
-  **squash merge**, since squashing leaves one commit on the branch dated at
-  merge time while your original commits and their real dates survive only on
-  the PR. That endpoint still serves them after the PR branch is deleted. The
-  search covers PRs you were involved in rather than only those you opened,
-  because on a shared branch a teammate often opens the PR carrying your commits;
-  narrowing to your own commits happens per commit, not per PR.
-- **Identity matching is the one place this can quietly under-count you.** GitHub
-  resolves each commit's `author` by matching its git email against emails
-  verified on an account, so that field is empty whenever the email is linked to
-  nobody — indistinguishable from a colleague's commit. The tool therefore reads
-  your verified emails (`/user/emails`, needs `user:email` scope) and matches on
-  those too. If the token lacks that scope, or a commit's email is on no account
-  at all, those commits are skipped — and the tool prints a warning naming each
-  unattributable email and how many commits it skipped, so give the token
-  `user:email` alongside `repo`, and check that output.
-- PR enumeration uses the search API, which returns at most 1000 results and
-  allows only 30 requests per minute. The tool stops at 1000 rather than pushing
-  past the ceiling, and warns; narrow the date range to reach the rest. The rate
-  limit only makes a large fetch slower.
-- If the PR pass fails partway, the default-branch commits already collected are
-  kept and cached, with a warning — rerun to retry the PR pass.
-- Commits on a non-default branch that never became a pull request are not
-  collected. Neither are PRs opened, reviews, or issues — GitHub counts those as
-  contributions but they are not commits, so no commit replica reproduces them.
-  Expect the replica to undercount a squares-per-day comparison slightly.
-- The REST API returns author dates in UTC and does not expose the original UTC
-  offset. You pick one offset for the whole replay; commits authored in another
-  timezone may land one calendar day off.
-- GitHub's `since`/`until` range filters on **committer date**, but this tool
-  replays **author date**. On rebased, cherry-picked, or imported history the two
-  can diverge, so the requested date range is approximate for that history.
-- `commits.json` is cached so re-runs don't re-hit the API. Delete it to force a
-  refetch. It contains **private repository names** and is written to whatever
-  directory you run the tool from — it may not be gitignored there, so don't
-  commit it.
+- A day's commits are spread evenly across 09:00–22:00 in the offset you choose, so
+  a day with hundreds of contributions cannot spill past midnight onto the next
+  square. Times of day are synthetic — the graph never showed them anyway.
+- The calendar returns dates directly, so no timezone conversion can shift a
+  contribution onto the wrong square. The offset you pick only decides what local
+  time the commits carry.
+- If `restrictedContributionsCount` comes back non-zero, contributions in private
+  repositories were counted but not visible in detail to your token — give it
+  `repo` scope. The tool prints that number.
+- Compare the printed total against your real profile graph on the first run. If it
+  looks low, the token is missing scope, or your profile has private contributions
+  excluded.
+- The replica contains only empty commits with messages like
+  `contribution 2026-09-01#7`. Anyone reading it can tell what it is.
+- `contributions.json` is cached so re-runs don't re-hit the API. Delete it to force
+  a refetch. It's written to whatever directory you run the tool from.
 - Nothing is pushed for you.
 
 ## Test
