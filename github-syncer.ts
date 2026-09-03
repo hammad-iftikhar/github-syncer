@@ -45,7 +45,7 @@ export async function ghGet(
   f: Fetcher = fetch,
   sleep: (ms: number) => Promise<void> = realSleep,
 ): Promise<Response> {
-  for (;;) {
+  for (; ;) {
     const res = await f(url, {
       headers: {
         authorization: `Bearer ${token}`,
@@ -258,7 +258,7 @@ async function askValid(
   ok: (s: string) => boolean,
   signal: AbortSignal,
 ): Promise<string> {
-  for (;;) {
+  for (; ;) {
     const a = await ask(rl, q, signal, def);
     if (ok(a)) return a;
     console.log("  invalid, try again");
@@ -266,7 +266,7 @@ async function askValid(
 }
 
 async function askRequired(rl: Interface, q: string, def: string, signal: AbortSignal): Promise<string> {
-  for (;;) {
+  for (; ;) {
     const a = await ask(rl, q, signal, def);
     if (a) return a;
     console.log("  required");
@@ -285,7 +285,7 @@ async function askSecret(rl: Interface, q: string, signal: AbortSignal): Promise
   const iface = rl as unknown as { _writeToOutput?: (s: string) => void };
   const original = iface._writeToOutput;
   stdout.write(`${q}: `);
-  iface._writeToOutput = () => {};
+  iface._writeToOutput = () => { };
   try {
     const value = (await rl.question("", { signal })).trim();
     stdout.write("\n");
