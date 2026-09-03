@@ -74,6 +74,8 @@ test("localOffset formats a whole-hour zone", () => {
 test("isDate accepts YYYY-MM-DD and rejects anything else", () => {
   assert.equal(isDate("2024-03-11"), true);
   assert.equal(isDate("2024-3-1"), false);
+  assert.equal(isDate("2024-02-30"), false, "a rolled-over date is not a date");
+  assert.equal(isDate("2026-06-31"), false);
   assert.equal(isDate("11-03-2024"), false);
   assert.equal(isDate(""), false);
 });
@@ -83,34 +85,51 @@ test("isOffset accepts signed HH:MM only", () => {
   assert.equal(isOffset("-05:30"), true);
   assert.equal(isOffset("05:00"), false);
   assert.equal(isOffset("+5:00"), false);
+  assert.equal(isOffset("+99:99"), false, "git records a bogus zone for this");
+  assert.equal(isOffset("+15:00"), false, "no real zone is past +14:00");
+  assert.equal(isOffset("+05:45"), true, "Nepal");
+  assert.equal(isOffset("+05:20"), false, "not a real quarter-hour zone");
 });
 
 // --- the contribution calendar ---
 
-test("yearWindows returns one window for a range inside a year", () => {
+test("yearWindows pads the range by a day at each end", () => {
   const w = yearWindows("2026-01-01", "2026-06-30");
   assert.equal(w.length, 1);
-  assert.equal(w[0].from, "2026-01-01T00:00:00.000Z");
-  assert.equal(w[0].to, "2026-06-30T23:59:59.000Z");
-});
-
-test("yearWindows splits a multi-year range into contiguous sub-year windows", () => {
-  const w = yearWindows("2023-05-10", "2026-09-03");
-  assert.ok(w.length >= 4, `expected at least 4 windows, got ${w.length}`);
-  assert.equal(w[0].from, "2023-05-10T00:00:00.000Z");
-  assert.equal(w.at(-1)!.to, "2026-09-03T23:59:59.000Z");
-  for (const win of w) {
-    const span = Date.parse(win.to) - Date.parse(win.from);
-    assert.ok(span <= 365 * 86_400_000, `window ${win.from}..${win.to} exceeds a year`);
-  }
-  // contiguous: each window starts one second after the previous one ended
-  for (let i = 1; i < w.length; i++) {
-    assert.equal(Date.parse(w[i].from) - Date.parse(w[i - 1].to), 1000);
-  }
+  assert.equal(w[0].from, "2025-12-31T00:00:00.000Z");
+  assert.equal(w[0].to, "2026-07-01T23:59:59.000Z");
 });
 
 test("yearWindows rejects a reversed range", () => {
   assert.throws(() => yearWindows("2026-09-03", "2023-05-10"), /after/);
+});
+
+test("every date in range is fully interior to some window, contributions' offsets included", () => {
+  // This is the property that makes fetchCalendar's Math.max correct. from/to filter by
+  // instant while the calendar buckets by local date, and an offset reaches 14h from UTC,
+  // so a date's contributions span its UTC day plus 14h on each side. Some single window
+  // must contain that whole span, or that date can only ever be seen partially.
+  const SPAN = 14 * 3_600_000;
+  for (const [since, until] of [
+    ["2026-09-03", "2026-09-03"],
+    ["2025-09-03", "2026-09-03"],
+    ["2023-05-10", "2026-09-03"],
+    ["2016-01-01", "2026-09-03"],
+  ]) {
+    const windows = yearWindows(since, until).map((w) => ({
+      from: Date.parse(w.from),
+      to: Date.parse(w.to),
+    }));
+    for (const w of windows) {
+      assert.ok(w.to - w.from <= 365 * 86_400_000, "each window stays inside the API's one-year cap");
+    }
+    for (let t = Date.parse(`${since}T00:00:00Z`); t <= Date.parse(`${until}T00:00:00Z`); t += 86_400_000) {
+      const lo = t - SPAN;
+      const hi = t + 86_400_000 - 1000 + SPAN;
+      const covered = windows.some((w) => w.from <= lo && w.to >= hi);
+      assert.ok(covered, `${new Date(t).toISOString().slice(0, 10)} is not wholly inside any window`);
+    }
+  }
 });
 
 test("ghGraphQL throws on an errors array inside a 200 response", async () => {
@@ -154,7 +173,7 @@ function calendarRes(days: { date: string; contributionCount: number }[], restri
   });
 }
 
-test("fetchCalendar keeps only active in-range days, sorted", async () => {
+test("fetchCalendar keeps only active in-range days, sorted, and reports the login", async () => {
   const f: Fetcher = async () =>
     calendarRes([
       { date: "2026-09-02", contributionCount: 3 },
@@ -162,24 +181,58 @@ test("fetchCalendar keeps only active in-range days, sorted", async () => {
       { date: "2026-08-31", contributionCount: 0 },
       { date: "2026-12-25", contributionCount: 9 },
     ]);
-  const days = await fetchCalendar("t", "2026-09-01", "2026-09-30", f);
+  const { login, days } = await fetchCalendar("t", "2026-09-01", "2026-09-30", f);
+  assert.equal(login, "me");
   assert.deepEqual(days, [
     { date: "2026-09-01", count: 22 },
     { date: "2026-09-02", count: 3 },
   ]);
 });
 
-test("fetchCalendar does not double-count a date returned by two overlapping windows", async () => {
-  // A multi-year range means several queries; if a date lands in two of them, its count
-  // must be taken once — adding them would inflate the replica.
+test("a date seen partially at a window seam takes its full count from the other window", async () => {
+  // The bug this guards: contributionsCollection filters by instant, so a date lying on a
+  // seam comes back with only part of its contributions. Windows overlap by two days so
+  // that date is also returned whole by the neighbouring window, and Math.max must take
+  // the whole one. Keeping the partial would silently undercount that square.
   let call = 0;
   const f: Fetcher = async () => {
     call++;
-    return calendarRes([{ date: "2025-06-01", contributionCount: 7 }]);
+    // window 1 sees the seam date partially; window 2 contains it whole
+    return calendarRes([{ date: "2026-09-01", contributionCount: call === 1 ? 4 : 13 }]);
   };
-  const days = await fetchCalendar("t", "2023-05-10", "2026-09-03", f);
-  assert.ok(call >= 4, `expected one query per window, got ${call}`);
-  assert.deepEqual(days, [{ date: "2025-06-01", count: 7 }]);
+  const { days } = await fetchCalendar("t", "2025-09-03", "2026-09-03", f);
+  assert.ok(call >= 2, `expected overlapping windows, got ${call} queries`);
+  assert.deepEqual(days, [{ date: "2026-09-01", count: 13 }]);
+});
+
+test("fetchCalendar warns but still returns days when a window's total disagrees with its days", async () => {
+  // The integrity check: the API reports each window's own total, so a mismatch means the
+  // calendar was parsed wrong — which would otherwise surface as a quietly short replica.
+  const f: Fetcher = async () =>
+    jsonRes({
+      data: {
+        viewer: {
+          login: "me",
+          contributionsCollection: {
+            restrictedContributionsCount: 0,
+            contributionCalendar: {
+              totalContributions: 99,
+              weeks: [{ contributionDays: [{ date: "2026-09-01", contributionCount: 5 }] }],
+            },
+          },
+        },
+      },
+    });
+  const errs: string[] = [];
+  const original = console.error;
+  console.error = (m: string) => errs.push(m);
+  try {
+    const { days } = await fetchCalendar("t", "2026-09-01", "2026-09-02", f);
+    assert.deepEqual(days, [{ date: "2026-09-01", count: 5 }]);
+  } finally {
+    console.error = original;
+  }
+  assert.ok(errs.some((e) => e.includes("99") && e.includes("5")), `expected a mismatch warning, got ${errs}`);
 });
 
 // --- synthesising commits from counts ---

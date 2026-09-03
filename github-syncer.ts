@@ -27,10 +27,14 @@ export function localOffset(d: Date = new Date()): string {
   return `${sign}${hh}:${mm}`;
 }
 
+// Round-tripped rather than merely parsed: Date.parse rolls 2024-02-30 over into March,
+// which would then disagree with the plain string comparisons used on dates elsewhere.
 export const isDate = (s: string): boolean =>
-  /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(s));
+  /^\d{4}-\d{2}-\d{2}$/.test(s) && new Date(`${s}T00:00:00Z`).toISOString().startsWith(s);
 
-export const isOffset = (s: string): boolean => /^[+-]\d{2}:\d{2}$/.test(s);
+// Real zones only. `+99:99` passes a looser regex and git will happily record it, writing
+// a commit whose absolute instant is days off what the local date implies.
+export const isOffset = (s: string): boolean => /^[+-](0\d|1[0-4]):(00|15|30|45)$/.test(s);
 
 export type Fetcher = (url: string, init?: RequestInit) => Promise<Response>;
 
@@ -110,19 +114,34 @@ export async function ghGraphQL(
 
 /**
  * contributionsCollection accepts at most one year per query, so a longer range is walked
- * in windows. 364 days keeps each window strictly inside the cap.
+ * in windows — but the two facts below decide how the seams are cut.
+ *
+ * `from`/`to` filter by INSTANT ("contributions made at this time or later"), while the
+ * calendar buckets each contribution by its own local date, and an offset can sit up to
+ * 14h from UTC. A calendar date's contributions therefore span roughly two UTC days, so a
+ * date lying on a window seam comes back with only part of its count.
+ *
+ * Windows are consequently 364 days long but advance only 362, overlapping by two days,
+ * and the range itself is padded a day at each end. Every date in [since, until] is then
+ * fully interior to at least one window, which is what lets fetchCalendar take each date's
+ * count with Math.max: the true full count wins, and a max cannot double-count a date
+ * however the API treats its edges.
  */
 export function yearWindows(since: string, until: string): { from: string; to: string }[] {
   const start = Date.parse(`${since}T00:00:00Z`);
   const end = Date.parse(`${until}T23:59:59Z`);
   if (Number.isNaN(start) || Number.isNaN(end)) throw new Error(`bad range: ${since}..${until}`);
   if (start > end) throw new Error(`since ${since} is after until ${until}`);
-  const WINDOW = 364 * 86_400_000;
+  const DAY = 86_400_000;
+  const SPAN = 364 * DAY;
+  const STEP = SPAN - 2 * DAY;
+  const first = start - DAY;
+  const last = end + DAY;
   const out: { from: string; to: string }[] = [];
-  for (let from = start; from <= end; ) {
-    const to = Math.min(from + WINDOW, end);
+  for (let from = first; ; from += STEP) {
+    const to = Math.min(from + SPAN, last);
     out.push({ from: new Date(from).toISOString(), to: new Date(to).toISOString() });
-    from = to + 1000;
+    if (to >= last) break;
   }
   return out;
 }
@@ -132,34 +151,54 @@ export async function fetchCalendar(
   since: string,
   until: string,
   f: Fetcher = fetch,
-): Promise<Day[]> {
+): Promise<{ login: string; days: Day[] }> {
   const byDate = new Map<string, number>();
   let login = "";
   let restricted = 0;
   for (const window of yearWindows(since, until)) {
     const { viewer } = (await ghGraphQL(CALENDAR_QUERY, window, token, f)).data!;
+    const calendar = viewer.contributionsCollection.contributionCalendar;
     login = viewer.login;
-    restricted += viewer.contributionsCollection.restrictedContributionsCount;
-    for (const week of viewer.contributionsCollection.contributionCalendar.weeks) {
+    restricted = Math.max(restricted, viewer.contributionsCollection.restrictedContributionsCount);
+
+    let walked = 0;
+    for (const week of calendar.weeks) {
       for (const day of week.contributionDays) {
+        walked += day.contributionCount;
         if (day.contributionCount === 0) continue;
-        if (day.date < since || day.date > until) continue;
-        // A date can appear in two adjacent windows. Its count is a property of the day,
-        // not of the window, so take it once rather than adding it twice.
+        // Windows overlap by two days, so a date can be seen twice: once partially, at a
+        // seam, and once in full from the window that contains it whole. Max takes the
+        // full one. See yearWindows for why summing would be wrong here.
         byDate.set(day.date, Math.max(byDate.get(day.date) ?? 0, day.contributionCount));
       }
     }
+    // The API reports the window's own total, so a mismatch against the days we walked
+    // means the calendar was parsed wrong — the one failure that would otherwise show up
+    // as a quietly short replica rather than an error.
+    if (walked !== calendar.totalContributions) {
+      console.error(
+        `warning: window ${window.from.slice(0, 10)}..${window.to.slice(0, 10)} reports ` +
+          `${calendar.totalContributions} contributions but its days sum to ${walked} — ` +
+          "the replica may be short. Please report this.",
+      );
+    }
   }
   const days = [...byDate.entries()]
+    .filter(([date]) => date >= since && date <= until)
     .map(([date, count]) => ({ date, count }))
     .sort((a, b) => a.date.localeCompare(b.date));
   const total = days.reduce((n, d) => n + d.count, 0);
   console.log(`${total} contributions across ${days.length} active days for ${login}`);
   if (restricted > 0) {
-    console.log(`  ${restricted} are in private repositories this token cannot see in detail`);
-    console.log("  give the token `repo` scope if that number should be zero");
+    console.log(
+      `  note: ${restricted} contributions are reported as restricted — made in private ` +
+        "repositories this token cannot see.",
+    );
+    console.log(
+      "  if the total above looks lower than your profile graph, give the token `repo` scope and refetch.",
+    );
   }
-  return days;
+  return { login, days };
 }
 
 /**
@@ -224,7 +263,9 @@ export function replay(entries: Entry[], o: ReplayOpts): void {
     execFileSync(
       "git",
       ["-C", o.dir, ...SAFE_GIT_CONFIG, "commit", "--allow-empty", "-q", "-m", `contribution ${e.id}`],
-      { env: { ...process.env, ...commitEnv(o.name, o.email, date) } },
+      // GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE in the caller's environment would override
+      // -C and land these commits in someone else's repository.
+      { env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined, ...commitEnv(o.name, o.email, date) } },
     );
     if (++n % 100 === 0) console.log(`  ${n}/${entries.length} commits`);
   }
@@ -251,6 +292,35 @@ export function renderScript(entries: Entry[], o: ReplayOpts): string {
 }
 
 const CACHE = "contributions.json";
+
+/** The cache records who and what was fetched, so a stale file cannot be reused blindly. */
+interface Cache {
+  login: string;
+  since: string;
+  until: string;
+  fetchedAt: string;
+  days: Day[];
+}
+
+function readCache(): Cache | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(CACHE, "utf8"));
+  } catch {
+    console.error(`warning: ${CACHE} is not valid JSON — ignoring it. Delete it to silence this.`);
+    return null;
+  }
+  const c = parsed as Cache;
+  const ok =
+    c && typeof c.login === "string" && isDate(c.since) && isDate(c.until) &&
+    Array.isArray(c.days) &&
+    c.days.every((d) => d && isDate(d.date) && Number.isInteger(d.count) && d.count > 0);
+  if (!ok) {
+    console.error(`warning: ${CACHE} is not in the expected shape — ignoring it. Delete it to silence this.`);
+    return null;
+  }
+  return c;
+}
 
 function gitConfig(key: string): string {
   try {
@@ -324,33 +394,42 @@ async function main(): Promise<void> {
   try {
     console.log("github-syncer — replicate one account's contribution graph as empty commits\n");
 
-    const token = process.env.GITHUB_TOKEN || (await askSecret(rl, "Source GitHub token", signal));
-    if (!token) throw new Error("a token is required");
-
-    let days: Day[] | null = null;
+    // Asked before the token, because reusing the cache needs no token at all.
+    let cached: Cache | null = null;
     if (existsSync(CACHE)) {
-      const cached = JSON.parse(readFileSync(CACHE, "utf8")) as Day[];
-      const when = statSync(CACHE).mtime.toISOString().slice(0, 16).replace("T", " ");
-      const cachedTotal = cached.reduce((n, d) => n + d.count, 0);
-      const range = cached.length > 0 ? `, ${cached[0].date}..${cached.at(-1)!.date}` : "";
-      if (
-        await askYes(
-          rl,
-          `Reuse ${CACHE} (${cachedTotal} contributions${range}, fetched ${when})?`,
-          true,
-          signal,
-        )
-      ) {
-        days = cached;
+      cached = readCache();
+    }
+    let days: Day[] | null = null;
+    if (cached) {
+      const total = cached.days.reduce((n, d) => n + d.count, 0);
+      const when = cached.fetchedAt.slice(0, 16).replace("T", " ");
+      console.log(
+        `${CACHE} holds ${total} contributions for ${cached.login}, ` +
+          `${cached.since}..${cached.until}, fetched ${when}`,
+      );
+      // The login is printed because a cache from another account is otherwise
+      // indistinguishable, and accepting it would replicate the wrong person's graph.
+      if (await askYes(rl, `Reuse it (it was fetched for ${cached.login})?`, true, signal)) {
+        days = cached.days;
       }
     }
 
     if (!days) {
+      const token = process.env.GITHUB_TOKEN || (await askSecret(rl, "Source GitHub token", signal));
+      if (!token) throw new Error("a token is required");
       const since = await askValid(rl, "Since date (YYYY-MM-DD)", isoDaysAgo(365), isDate, signal);
       const until = await askValid(rl, "Until date (YYYY-MM-DD)", isoDaysAgo(0), isDate, signal);
       console.log("\nfetching contribution calendar...");
-      days = await fetchCalendar(token, since, until);
-      writeFileSync(CACHE, `${JSON.stringify(days, null, 2)}\n`);
+      const fetched = await fetchCalendar(token, since, until);
+      days = fetched.days;
+      const record: Cache = {
+        login: fetched.login,
+        since,
+        until,
+        fetchedAt: new Date().toISOString(),
+        days,
+      };
+      writeFileSync(CACHE, `${JSON.stringify(record, null, 2)}\n`);
       console.log(`cached ${days.length} active days to ${CACHE}`);
     }
 

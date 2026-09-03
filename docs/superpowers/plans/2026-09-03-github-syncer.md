@@ -1,3 +1,7 @@
+> **Superseded.** This plan describes the original REST commit-scanning implementation.
+> The tool now replicates the contribution graph via the GraphQL calendar; see the spec's
+> History section. Kept as the record of how the first version was built.
+
 # github-syncer Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

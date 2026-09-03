@@ -52,75 +52,126 @@ required to run. Zero dependencies: global `fetch`, `node:readline/promises`,
 
 ## Interaction
 
-Nine prompts, asked in order. Every prompt accepts its default on a bare Enter.
+Ten prompts at most, asked in order. Every prompt accepts its default on a bare Enter.
 
-| # | Prompt | Default |
-|---|--------|---------|
-| 1 | Source GitHub token | `$GITHUB_TOKEN` if set; otherwise prompt with terminal echo muted |
-| 2 | Since date (`YYYY-MM-DD`) | one year before today |
-| 3 | Until date (`YYYY-MM-DD`) | today |
-| 4 | Timezone offset to stamp commits with | the machine's current UTC offset |
-| 5 | Destination author name | `git config user.name` |
-| 6 | Destination author email | `git config user.email` |
-| 7 | Output directory | `./replica` |
-| 8 | Commit now, or only write `replay.sh`? | commit now |
-| 9 | Summary, then proceed? | **no** |
+| # | Prompt | Default | Asked when |
+|---|--------|---------|-----------|
+| 1 | Reuse `contributions.json`? | yes | the cache exists and is valid |
+| 2 | Source GitHub token | `$GITHUB_TOKEN` if set; otherwise prompt with echo muted | the cache is not being reused |
+| 3 | Since date (`YYYY-MM-DD`) | one year before today | as above |
+| 4 | Until date (`YYYY-MM-DD`) | today | as above |
+| 5 | Timezone offset to stamp commits with | the machine's current UTC offset | always |
+| 6 | Destination author name | `git config user.name` | always |
+| 7 | Destination author email | `git config user.email` | always |
+| 8 | Output directory | `./replica` | always |
+| 9 | Commit now, or only write `replay.sh`? | commit now | always |
+| 10 | Summary, then proceed? | **no** | always |
 
-Prompt 6 prints a warning that the email must be a *verified* email on the
-destination account, or GitHub attributes the commits to no one and the
-contribution graph stays empty.
+The cache question comes before the token question because reusing the cache needs no
+token at all, and asking for a secret that will not be used is worse than asking one
+question out of order. The prompt names the login the cache was fetched for: a cache
+from another account is otherwise indistinguishable, and accepting it would replicate
+the wrong person's graph.
 
-Prompt 9 prints the contribution total, the number of active days, the date range,
-the busiest day, the destination identity, and the output path before anything is
-written to the output directory or to `replay.sh`. It is the only prompt that
-defaults to no. `contributions.json` is the exception: it is deliberately written
-earlier, as a cache, so an aborted run does not have to re-fetch.
+Prompt 7 prints a warning that the email must be a *verified* email on the destination
+account, or GitHub attributes the commits to no one and the contribution graph stays
+empty.
 
-Dates are validated as `YYYY-MM-DD` and re-asked on bad input; the offset as
-`±HH:MM`. Name, email, and directory reject empty values, since an empty author
-identity produces commits git will not attribute.
+Prompt 10 prints the contribution total, the number of active days, the date range, the
+busiest day, the destination identity, and the output path before anything is written to
+the output directory or to `replay.sh`. It is the only prompt that defaults to no.
+`contributions.json` is the exception: it is deliberately written earlier, as a cache, so
+an aborted run does not have to re-fetch.
 
-The existing-directory check runs immediately after prompt 7, before the summary,
-so a run that will be refused is refused before the user confirms it.
+Dates are validated as `YYYY-MM-DD` and round-tripped through `Date`, so `2024-02-30`
+is rejected rather than silently rolled over into March — the plain string comparisons
+used on dates elsewhere would otherwise disagree with the parsed value. The offset is
+validated against real zones only, `±(00-14):(00|15|30|45)`: git accepts `+99:99` and
+records a commit whose absolute instant is days away from what its local date implies.
+Name, email, and directory reject empty values.
+
+The existing-directory check runs immediately after prompt 8, before the summary, so a
+run that will be refused is refused before the user confirms it.
 
 ## Fetching the calendar
 
-`GITHUB_TOKEN` or the prompt supplies the token. The token needs `read:user`, and
-`repo` for private-repository contributions to be counted.
+`GITHUB_TOKEN` or the prompt supplies the token. The token needs `read:user`, and `repo`
+for private-repository contributions to be counted.
 
-1. The requested range is split into windows of at most 364 days, since
-   `contributionsCollection` accepts at most one year per query. Windows are
-   contiguous: each begins one second after the previous ends.
+The window arithmetic is the subtle part, and getting it wrong undercounts the graph
+silently. Two facts drive it:
+
+- `contributionsCollection` accepts at most one year per query.
+- Its `from`/`to` arguments filter by **instant** — "only contributions made at this time
+  or later" — while the calendar buckets each contribution by its own *local* date, and
+  an offset can sit up to 14 hours from UTC.
+
+Together those mean a calendar date's contributions span roughly two UTC days, so a date
+lying on a window seam is returned with only *part* of its count. An earlier revision of
+this design asserted the opposite — that a day's count is a property of the day and not
+of the window — and took `Math.max` over non-overlapping windows, which threw away the
+smaller half of one date's activity per seam.
+
+The fix is not to sum the partials, which would be correct only under that one reading of
+the API. Instead:
+
+1. Windows are 364 days long but advance only 362, overlapping by two days, and the
+   requested range is padded by one day at each end. Every date in `[since, until]` is
+   then wholly interior to at least one window — 24 hours of padding covers the 14-hour
+   maximum offset with room to spare.
 2. Each window is one POST to `https://api.github.com/graphql` requesting
    `viewer { login, contributionsCollection { restrictedContributionsCount,
    contributionCalendar { totalContributions, weeks { contributionDays { date,
    contributionCount } } } } }`.
-3. Days with a zero count are dropped, as are dates outside the requested range —
-   the calendar is week-aligned and so overhangs both ends.
-4. A date appearing in two adjacent windows is taken once, not summed: the count is
-   a property of the day, not of the window. Adding them would inflate the replica.
-5. Days are returned sorted ascending by date.
+3. Each date's count is taken with `Math.max` across windows. Since some window holds the
+   date whole, the true full count wins; and a max cannot double-count a date however the
+   API treats its edges. This is correct under both readings of the argument semantics,
+   which is why it is preferred to summing.
+4. Days with a zero count are dropped, as are dates outside the requested range — the
+   calendar is week-aligned and the windows are padded, so both ends overhang.
+5. Days are returned sorted ascending by date, alongside the viewer's login.
 
-`restrictedContributionsCount` is reported when non-zero, since it means
-contributions were counted in private repositories the token cannot see in detail —
-usually a missing `repo` scope.
+### Integrity check
+
+Each window reports its own `totalContributions`. The days walked out of that window's
+`weeks` must sum to it; a mismatch means the calendar was parsed wrong, and is reported as
+a warning naming both numbers. This is the check that turns the whole class of
+"quietly short replica" bug into something the user sees on the first run. Requesting
+`totalContributions` costs nothing extra, since it rides in the same query.
+
+`restrictedContributionsCount` is reported when non-zero. The message states the
+consequence — that contributions were made in private repositories this token cannot see,
+and that a total lower than the profile graph means the token needs `repo` scope — rather
+than implying anything about whether those contributions are inside the daily counts.
 
 ### Error handling
 
-GraphQL reports failures inside a 200 response body, so an unchecked `errors` array
-would read as "no contributions" — the silent wrongness this tool can least afford.
-Both a non-ok status and a non-empty `errors` array throw with the message.
+GraphQL reports failures inside a 200 response body, so an unchecked `errors` array would
+read as "no contributions" — the silent wrongness this tool can least afford. Both a
+non-ok status and a non-empty `errors` array throw with the message.
 
-Rate limiting needs no special handling: a decade of history is ten queries.
+Rate limiting needs no special handling: each query costs one point of a 5,000-per-hour
+budget and a decade of history is eleven queries, issued serially. A 403 or 429 fails the
+status check and throws; a GraphQL `RATE_LIMITED` error arrives inside a 200 and hits the
+`errors` check. Neither can be mistaken for an empty graph.
 
 ### contributions.json
 
 ```json
-[{ "date": "2026-09-01", "count": 22 }]
+{
+  "login": "octocat",
+  "since": "2025-09-03",
+  "until": "2026-09-03",
+  "fetchedAt": "2026-09-03T12:00:00.000Z",
+  "days": [{ "date": "2026-09-01", "count": 22 }]
+}
 ```
 
-If the file exists, the tool reports its total, its date range and its modification
-time, and asks whether to reuse it instead of calling the API.
+The provenance fields exist so a stale cache cannot be reused blindly: the login is shown
+in the reuse prompt, and the requested range is recorded because the first and last
+*active* dates are not the same thing as the range that was asked for. The file is
+validated on read — shape, date formats, and positive integer counts — and a malformed
+cache is reported and ignored rather than parsed into a wrong replica.
 
 ## Synthesising commits
 
@@ -170,8 +221,10 @@ TTY once per commit, and a global hook would run arbitrary code once per commit.
 Branch `main` is created explicitly because GitHub counts commits only on a
 repository's default branch.
 
-Commits are invoked via `execFileSync` with an argument array — never a shell
-string — so identity values cannot inject shell syntax.
+Commits are invoked via `execFileSync` with an argument array — never a shell string — so
+identity values cannot inject shell syntax. `GIT_DIR`, `GIT_WORK_TREE` and
+`GIT_INDEX_FILE` are cleared from the child environment: inherited from the caller they
+override `-C` and would land the replica's commits in another repository.
 
 Progress is reported every 100 commits; a multi-thousand-commit replay otherwise
 looks hung.
@@ -204,21 +257,35 @@ escaped, without exception.
 | Zero contributions in range | Report and exit before creating any repo |
 | Ctrl-D at any prompt | Abort cleanly with "cancelled, nothing written" |
 | `git` not on PATH | Propagate the `execFileSync` error |
+| Malformed `contributions.json` | Report and ignore the cache; fetch instead |
+| Window total disagrees with its days | Warn naming both numbers; continue |
 
 ## Verification
 
 `test.ts`, run via `node --test test.ts`.
 
-The load-bearing test is the invariant that every synthesised entry lands on its own
-calendar day, checked across `+00:00`, `+05:00`, `+05:30`, `-08:00`, `+14:00` and
-`-11:00`, including a 300-contribution day. Alongside it, two tests read real git
-objects back out of a temporary repository: one asserting a fixture's author dates
-and local days exactly, including a commit that crosses the day boundary, and one
-asserting that 22 counted contributions produce 22 commits all on the same square.
+Two properties carry the design, and each has a test that fails if it breaks.
+
+The first is that every synthesised entry lands on the calendar day it was counted on,
+checked across `+00:00`, `+05:00`, `+05:30`, `-08:00`, `+14:00` and `-11:00`, including a
+300-contribution day. Alongside it, two tests read real git objects back out of a
+temporary repository: one asserting a fixture's author dates, committer dates and local
+days exactly, including a commit that crosses the day boundary, and one asserting that 22
+counted contributions produce 22 commits all on the same square.
+
+The second is that every date in the requested range is wholly interior to some window —
+the property that makes `Math.max` correct. It is tested directly, over four ranges from
+one day to a decade, by checking that each date's UTC day plus fourteen hours on either
+side fits inside a single window. A companion test feeds two overlapping windows a
+partial count and a full count for the same seam date and asserts the full one survives;
+that test fails against the `Math.max`-over-non-overlapping-windows arrangement this
+design previously specified.
+
 The generated script is executed with bash and its author dates compared against the
-direct replay. Quoting, the script's guard line, the existing-directory refusal, and
-the calendar's window-splitting, zero-day filtering and cross-window de-duplication
-each have their own test.
+direct replay, so the two paths cannot silently diverge. Quoting, the script's guard line,
+the existing-directory refusal, the GraphQL error-inside-200 check, the per-window
+integrity warning, and the calendar's zero-day and out-of-range filtering each have their
+own test.
 
 ## Deliberately skipped
 

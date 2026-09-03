@@ -1,3 +1,7 @@
+> **Historical.** These rulings were made while building the original REST
+> commit-scanning implementation, most of which has since been deleted. Kept as the
+> record of decisions taken on the user's behalf at the time.
+
 # SDD ledger — plan: docs/superpowers/plans/2026-09-03-github-syncer.md
 
 Spec: docs/superpowers/specs/2026-09-03-github-syncer-design.md (read)

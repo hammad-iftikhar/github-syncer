@@ -20,7 +20,8 @@ if `git config user.name`/`user.email` are unset.
 
 Provide the source token via `GITHUB_TOKEN` to skip the token prompt. The token
 needs `read:user` for the calendar, and `repo` for contributions in private
-repositories to be counted.
+repositories to be counted. Reusing a cached fetch needs no token at all, which is
+why that question comes first.
 
 At the end you choose whether to commit the replica immediately or write a
 `replay.sh` script to run later — review it first, since it contains the full
@@ -72,7 +73,12 @@ viewer { contributionsCollection(from: "…", to: "…") {
 - The replica contains only empty commits with messages like
   `contribution 2026-09-01#7`. Anyone reading it can tell what it is.
 - `contributions.json` is cached so re-runs don't re-hit the API. Delete it to force
-  a refetch. It's written to whatever directory you run the tool from.
+  a refetch. It's written to whatever directory you run the tool from, and it records
+  which account and date range it was fetched for — the reuse prompt shows the login,
+  so a cache from another account can't be accepted by accident.
+- With `repo` scope the calendar counts private contributions, which your *public*
+  source profile may be hiding. The replica's graph can therefore legitimately show
+  **more** than the source profile shows a visitor.
 - Nothing is pushed for you.
 
 ## Test
