@@ -130,3 +130,70 @@ test("paginate throws on other errors", async () => {
   const boom: Fetcher = async () => jsonRes({ message: "server error" }, {}, 500);
   await assert.rejects(() => paginate("https://api.github.com/r", "t", boom), /500/);
 });
+
+import { activeRepos, dedupeSort, whoAmI, collectCommits, type Repo, type Commit } from "./github-syncer.ts";
+
+test("activeRepos drops repos untouched since the start date", () => {
+  const repos: Repo[] = [
+    { full_name: "me/old", pushed_at: "2019-01-01T00:00:00Z" },
+    { full_name: "me/new", pushed_at: "2025-06-01T00:00:00Z" },
+    { full_name: "me/never", pushed_at: null },
+  ];
+  assert.deepEqual(activeRepos(repos, "2024-01-01").map((r) => r.full_name), ["me/new", "me/never"]);
+});
+
+test("dedupeSort removes duplicate shas and orders by date", () => {
+  const input: Commit[] = [
+    { sha: "bbb", repo: "me/b", date: "2024-05-01T00:00:00Z" },
+    { sha: "aaa", repo: "me/a", date: "2024-01-01T00:00:00Z" },
+    { sha: "bbb", repo: "me/b-fork", date: "2024-05-01T00:00:00Z" },
+  ];
+  const out = dedupeSort(input);
+  assert.deepEqual(out.map((c) => c.sha), ["aaa", "bbb"]);
+  assert.equal(out[1].repo, "me/b", "first occurrence of a sha wins");
+});
+
+test("whoAmI returns the token owner's login", async () => {
+  const f: Fetcher = async () => jsonRes({ login: "octocat" });
+  assert.equal(await whoAmI("t", f), "octocat");
+});
+
+test("whoAmI throws a clear error on a bad token", async () => {
+  const f: Fetcher = async () => jsonRes({ message: "Bad credentials" }, {}, 401);
+  await assert.rejects(() => whoAmI("bad", f), /401/);
+});
+
+test("collectCommits queries only active repos and returns sorted unique commits", async () => {
+  const asked: string[] = [];
+  const f: Fetcher = async (url) => {
+    if (url.includes("/user/repos")) {
+      return jsonRes([
+        { full_name: "me/old", pushed_at: "2019-01-01T00:00:00Z" },
+        { full_name: "me/live", pushed_at: "2025-06-01T00:00:00Z" },
+      ]);
+    }
+    if (url.endsWith("/user")) return jsonRes({ login: "me" });
+    asked.push(url);
+    return jsonRes([
+      { sha: "c2", commit: { author: { date: "2024-05-02T10:00:00Z" } } },
+      { sha: "c1", commit: { author: { date: "2024-05-01T10:00:00Z" } } },
+    ]);
+  };
+  const commits = await collectCommits("t", "2024-01-01", "2024-12-31", f);
+  assert.equal(asked.length, 1, "the stale repo is never queried");
+  assert.match(asked[0], /me\/live\/commits/);
+  assert.match(asked[0], /author=me/);
+  assert.match(asked[0], /since=2024-01-01T00%3A00%3A00Z/);
+  assert.match(asked[0], /until=2024-12-31T23%3A59%3A59Z/);
+  assert.deepEqual(commits.map((c) => c.sha), ["c1", "c2"]);
+  assert.equal(commits[0].repo, "me/live");
+});
+
+test("collectCommits skips commits with no author date", async () => {
+  const f: Fetcher = async (url) => {
+    if (url.endsWith("/user")) return jsonRes({ login: "me" });
+    if (url.includes("/user/repos")) return jsonRes([{ full_name: "me/r", pushed_at: "2025-01-01T00:00:00Z" }]);
+    return jsonRes([{ sha: "x", commit: { author: null } }]);
+  };
+  assert.deepEqual(await collectCommits("t", "2024-01-01", "2024-12-31", f), []);
+});

@@ -76,3 +76,73 @@ export async function paginate<T>(url: string, token: string, f: Fetcher = fetch
   }
   return out;
 }
+
+export interface Repo {
+  full_name: string;
+  pushed_at: string | null;
+}
+
+export interface ApiCommit {
+  sha: string;
+  commit: { author: { date: string } | null };
+}
+
+export interface Commit {
+  sha: string;
+  repo: string;
+  date: string;
+}
+
+const API = "https://api.github.com";
+
+// pushed_at and `since` are both ISO-prefixed, so a string compare is a date compare.
+export function activeRepos(repos: Repo[], since: string): Repo[] {
+  return repos.filter((r) => !r.pushed_at || r.pushed_at >= since);
+}
+
+export function dedupeSort(commits: Commit[]): Commit[] {
+  const seen = new Map<string, Commit>();
+  for (const c of commits) if (!seen.has(c.sha)) seen.set(c.sha, c);
+  return [...seen.values()].sort((a, b) => a.date.localeCompare(b.date));
+}
+
+export async function whoAmI(token: string, f: Fetcher = fetch): Promise<string> {
+  const res = await ghGet(`${API}/user`, token, f);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText} — token rejected by GET /user`);
+  return ((await res.json()) as { login: string }).login;
+}
+
+export async function collectCommits(
+  token: string,
+  since: string,
+  until: string,
+  f: Fetcher = fetch,
+): Promise<Commit[]> {
+  const login = await whoAmI(token, f);
+  const repos = await paginate<Repo>(
+    `${API}/user/repos?affiliation=owner,collaborator,organization_member&per_page=100`,
+    token,
+    f,
+  );
+  const live = activeRepos(repos, since);
+  console.log(`${repos.length} repos accessible, ${live.length} touched since ${since}`);
+
+  // ponytail: repos are walked serially. Fine at a few hundred repos; parallelise
+  // with a small concurrency pool if a fetch ever takes long enough to care about.
+  const out: Commit[] = [];
+  for (const [i, repo] of live.entries()) {
+    const q = new URLSearchParams({
+      author: login,
+      since: `${since}T00:00:00Z`,
+      until: `${until}T23:59:59Z`,
+      per_page: "100",
+    });
+    const commits = await paginate<ApiCommit>(`${API}/repos/${repo.full_name}/commits?${q}`, token, f);
+    for (const c of commits) {
+      if (!c.commit.author?.date) continue;
+      out.push({ sha: c.sha, repo: repo.full_name, date: c.commit.author.date });
+    }
+    console.log(`  [${i + 1}/${live.length}] ${repo.full_name}: ${commits.length}`);
+  }
+  return dedupeSort(out);
+}
