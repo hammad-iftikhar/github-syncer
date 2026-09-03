@@ -1,5 +1,6 @@
 node_modules/
 commits.json
+contributions.json
 replay.sh
 replica/
 .DS_Store
