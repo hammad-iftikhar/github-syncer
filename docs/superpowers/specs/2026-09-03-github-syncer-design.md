@@ -137,7 +137,7 @@ Refuse to proceed if the output directory already exists, rather than appending
 a second copy of the history. Report the path and exit.
 
 ```
-git init -q -b main <outdir>
+git init -q -b main -- <outdir>
 ```
 
 Then, per commit, in date order:
@@ -145,7 +145,8 @@ Then, per commit, in date order:
 ```
 GIT_AUTHOR_NAME=<name>  GIT_AUTHOR_EMAIL=<email>  GIT_AUTHOR_DATE=<iso+offset>
 GIT_COMMITTER_NAME=<name> GIT_COMMITTER_EMAIL=<email> GIT_COMMITTER_DATE=<iso+offset>
-git commit --allow-empty -q -m "sync <sha[0:7]>"
+git -c commit.gpgsign=false -c core.hooksPath=/dev/null \
+  commit --allow-empty -q -m "sync <sha[0:7]>"
 ```
 
 Author and committer dates are both set: GitHub's contribution graph reads the
