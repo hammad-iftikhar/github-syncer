@@ -79,6 +79,8 @@ viewer { contributionsCollection(from: "…", to: "…") {
 - With `repo` scope the calendar counts private contributions, which your *public*
   source profile may be hiding. The replica's graph can therefore legitimately show
   **more** than the source profile shows a visitor.
+- The replay spawns one `git` process per commit, so a busy decade (20k+ contributions)
+  takes minutes and prints a counter every 100. That is the slow part, not the fetch.
 - Nothing is pushed for you.
 
 ## Test
