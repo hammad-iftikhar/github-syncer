@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createInterface, type Interface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
+import { resolve } from "node:path";
 
 export function toOffset(utcIso: string, offset: string): string {
   const m = /^([+-])(\d{2}):(\d{2})$/.exec(offset);
@@ -73,8 +74,10 @@ export async function paginate<T>(url: string, token: string, f: Fetcher = fetch
   // ever talks to another API.
   while (next) {
     const res = await ghGet(next, token, f);
-    // 409 = empty repo, 404 = access lost between listing and reading. Neither is fatal.
-    if (res.status === 409 || res.status === 404) return out;
+    // 409 = empty repo, 404 = access lost between listing and reading. Neither is fatal,
+    // but only on the first page — a 404/409 after we already have results means access
+    // was lost mid-pagination, and returning what we have so far would silently truncate.
+    if ((res.status === 409 || res.status === 404) && out.length === 0) return out;
     if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${next}`);
     out.push(...((await res.json()) as T[]));
     next = nextLink(res.headers.get("link"));
@@ -114,6 +117,18 @@ export function dedupeSort(commits: Commit[]): Commit[] {
 export async function whoAmI(token: string, f: Fetcher = fetch): Promise<string> {
   const res = await ghGet(`${API}/user`, token, f);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText} — token rejected by GET /user`);
+  const scopes = res.headers.get("x-oauth-scopes");
+  if (scopes) {
+    if (!scopes.split(",").map((s) => s.trim()).includes("repo")) {
+      console.error(
+        "warning: this token's scopes do not include `repo` — private repositories will be invisible to it, so the replica will be incomplete.",
+      );
+    }
+  } else {
+    console.error(
+      "warning: token scopes could not be verified (fine-grained tokens don't report them) — confirm this token can read your private repos.",
+    );
+  }
   return ((await res.json()) as { login: string }).login;
 }
 
@@ -174,18 +189,23 @@ export function commitEnv(name: string, email: string, date: string): Record<str
   };
 }
 
+// Both flags below keep the replay independent of the user's global git config:
+// commit.gpgsign=true would otherwise try to launch pinentry with no TTY attached,
+// and a global hook could run arbitrary code once per commit.
+const SAFE_GIT_CONFIG = ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"];
+
 // ponytail: no resume. A replay that dies partway leaves a partial repo and the
 // only recovery is `rm -rf` and rerun; commits are empty so regenerating is cheap
 // and commits.json is already cached. Add resume if a real replay ever dies.
 export function replay(commits: Commit[], o: ReplayOpts): void {
   if (existsSync(o.dir)) throw new Error(`${o.dir} already exists — refusing to append to it`);
-  execFileSync("git", ["init", "-q", "-b", "main", o.dir]);
+  execFileSync("git", ["init", "-q", "-b", "main", "--", o.dir]);
   let n = 0;
   for (const c of commits) {
     const date = toOffset(c.date, o.offset);
     execFileSync(
       "git",
-      ["-C", o.dir, "commit", "--allow-empty", "-q", "-m", `sync ${c.sha.slice(0, 7)}`],
+      ["-C", o.dir, ...SAFE_GIT_CONFIG, "commit", "--allow-empty", "-q", "-m", `sync ${c.sha.slice(0, 7)}`],
       { env: { ...process.env, ...commitEnv(o.name, o.email, date) } },
     );
     if (++n % 100 === 0) console.log(`  ${n}/${commits.length} commits`);
@@ -196,7 +216,8 @@ export function renderScript(commits: Commit[], o: ReplayOpts): string {
   const lines = [
     "#!/usr/bin/env bash",
     "set -e",
-    `git init -q -b main ${shq(o.dir)}`,
+    `test -e ${shq(o.dir)} && { echo ${shq(`${o.dir} already exists — refusing to append to it`)} >&2; exit 1; }`,
+    `git init -q -b main -- ${shq(o.dir)}`,
     "",
   ];
   for (const c of commits) {
@@ -204,7 +225,7 @@ export function renderScript(commits: Commit[], o: ReplayOpts): string {
     lines.push(
       `GIT_AUTHOR_NAME=${shq(o.name)} GIT_AUTHOR_EMAIL=${shq(o.email)} GIT_AUTHOR_DATE=${shq(date)} \\`,
       `GIT_COMMITTER_NAME=${shq(o.name)} GIT_COMMITTER_EMAIL=${shq(o.email)} GIT_COMMITTER_DATE=${shq(date)} \\`,
-      `  git -C ${shq(o.dir)} commit --allow-empty -q -m ${shq(`sync ${c.sha.slice(0, 7)}`)}`,
+      `  git -C ${shq(o.dir)} -c commit.gpgsign=false -c core.hooksPath=/dev/null commit --allow-empty -q -m ${shq(`sync ${c.sha.slice(0, 7)}`)}`,
     );
   }
   lines.push("", `echo ${shq(`created ${commits.length} commits in ${o.dir}`)}`, "");
@@ -292,7 +313,11 @@ async function main(): Promise<void> {
     if (existsSync(CACHE)) {
       const cached = JSON.parse(readFileSync(CACHE, "utf8")) as Commit[];
       const when = statSync(CACHE).mtime.toISOString().slice(0, 16).replace("T", " ");
-      if (await askYes(rl, `Reuse ${CACHE} (${cached.length} commits, fetched ${when})?`, true, signal)) {
+      const range =
+        cached.length > 0 ? `, ${cached[0].date.slice(0, 10)}..${cached.at(-1)!.date.slice(0, 10)}` : "";
+      if (
+        await askYes(rl, `Reuse ${CACHE} (${cached.length} commits${range}, fetched ${when})?`, true, signal)
+      ) {
         commits = cached;
       }
     }
@@ -323,6 +348,10 @@ async function main(): Promise<void> {
     console.log("  or GitHub will attribute the commits to nobody and the graph stays empty.");
     const email = await askRequired(rl, "Destination author email", gitConfig("user.email"), signal);
     const dir = await askRequired(rl, "Output directory", "./replica", signal);
+    // Checked here — before the summary — rather than only inside replay(), so a user
+    // in script mode (which has no directory-exists check of its own) is not asked to
+    // confirm a run that is refused right after. See replay()'s own check for its contract.
+    if (existsSync(dir)) throw new Error(`${dir} already exists — refusing to append to it`);
     const commitNow = await askYes(rl, "Commit now? (n = only write replay.sh)", true, signal);
 
     const opts: ReplayOpts = { dir, name, email, offset };
@@ -341,7 +370,10 @@ async function main(): Promise<void> {
       replay(commits, opts);
       console.log(`\ncreated ${commits.length} commits in ${dir}`);
     } else {
-      writeFileSync("replay.sh", renderScript(commits, opts));
+      // replay.sh is always written to the cwd, but `dir` may be relative — resolve it
+      // now so the script builds the replica in the right place even if `bash replay.sh`
+      // is later run from a different directory.
+      writeFileSync("replay.sh", renderScript(commits, { ...opts, dir: resolve(dir) }));
       console.log(`\nwrote replay.sh — review it, then: bash replay.sh`);
       return;
     }

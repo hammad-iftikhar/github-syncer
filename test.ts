@@ -131,6 +131,14 @@ test("paginate throws on other errors", async () => {
   await assert.rejects(() => paginate("https://api.github.com/r", "t", boom), /500/);
 });
 
+test("paginate rejects a 404 that arrives after a page already succeeded, instead of truncating silently", async () => {
+  const f: Fetcher = async (url) =>
+    url.includes("page=2")
+      ? jsonRes({ message: "Not Found" }, {}, 404)
+      : jsonRes([{ id: 1 }], { link: '<https://api.github.com/r?page=2>; rel="next"' });
+  await assert.rejects(() => paginate("https://api.github.com/r", "t", f), /404/);
+});
+
 import { activeRepos, dedupeSort, whoAmI, collectCommits, type Repo, type Commit } from "./github-syncer.ts";
 
 test("activeRepos drops repos untouched since the start date", () => {
@@ -207,12 +215,18 @@ import { replay, renderScript, shq, commitEnv, type ReplayOpts } from "./github-
 const FIXTURE: Commit[] = [
   { sha: "aaaaaaa1111", repo: "me/one", date: "2024-03-11T09:22:07Z" },
   { sha: "bbbbbbb2222", repo: "me/two", date: "2024-06-02T18:45:00Z" },
+  // Crosses the day boundary at +05:00 (2024-06-02T20:30:00Z -> 2024-06-03T01:30:00+05:00).
+  // This is the one property the whole tool exists to deliver — which calendar square a
+  // commit lands on — and until this fixture entry it was never verified through real git
+  // objects, only through the toOffset unit tests.
+  { sha: "ddddddd4444", repo: "me/two", date: "2024-06-02T20:30:00Z" },
   { sha: "ccccccc3333", repo: "me/two", date: "2025-01-15T04:05:06Z" },
 ];
 
 const EXPECTED_AT_PLUS_5 = [
   "2024-03-11T14:22:07+05:00",
   "2024-06-02T23:45:00+05:00",
+  "2024-06-03T01:30:00+05:00",
   "2025-01-15T09:05:06+05:00",
 ];
 
@@ -240,7 +254,7 @@ test("replay writes commits whose author dates match the converted timestamps ex
     const log = execFileSync("git", ["-C", dir, "log", "--reverse", "--format=%aI|%cI|%an|%ae|%s"], {
       encoding: "utf8",
     }).trim().split("\n");
-    assert.equal(log.length, 3);
+    assert.equal(log.length, 4);
     assert.deepEqual(log.map((l) => l.split("|")[0]), EXPECTED_AT_PLUS_5);
     assert.deepEqual(log.map((l) => l.split("|")[1]), EXPECTED_AT_PLUS_5, "committer dates match author dates");
     assert.equal(log[0].split("|")[3], "me@example.com");
@@ -249,6 +263,15 @@ test("replay writes commits whose author dates match the converted timestamps ex
     assert.equal(branch, "main");
     const tree = execFileSync("git", ["-C", dir, "show", "--stat", "--format=", "HEAD"], { encoding: "utf8" }).trim();
     assert.equal(tree, "", "commits are empty");
+    // The one property this product exists to deliver: which calendar square a commit
+    // lands on. A 2024-06-02T20:30:00Z author date at +05:00 is local 2024-06-03T01:30,
+    // so it must land on the 2024-06-03 square, not 2024-06-02.
+    const localDays = execFileSync(
+      "git",
+      ["-C", dir, "log", "--reverse", "--date=format:%Y-%m-%d", "--format=%ad"],
+      { encoding: "utf8" },
+    ).trim().split("\n");
+    assert.deepEqual(localDays, ["2024-03-11", "2024-06-02", "2024-06-03", "2025-01-15"]);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -269,7 +292,7 @@ test("replay refuses an existing output directory", () => {
   }
 });
 
-test("the rendered script produces byte-identical history to a direct replay", () => {
+test("renderScript's generated script writes commits whose author dates match the converted timestamps exactly", () => {
   const base = scratch();
   try {
     const o: ReplayOpts = { dir: join(base, "from-script"), name: "Me", email: "me@example.com", offset: "+05:00" };
@@ -290,6 +313,19 @@ test("renderScript escapes a single quote in the output directory path everywher
   const script = renderScript(FIXTURE, o);
   assert.ok(script.includes("it'\\''s"), "the quote in the path is escaped the way shq() escapes it");
   assert.ok(!script.includes("it's here"), "no unescaped single quote reaches the script");
+});
+
+test("renderScript's guard line refuses an existing output directory before git init runs", () => {
+  const o: ReplayOpts = { dir: "/tmp/it's here", name: "Me", email: "me@example.com", offset: "+05:00" };
+  const script = renderScript(FIXTURE, o);
+  const lines = script.split("\n");
+  const guardIndex = lines.findIndex((l) => l.startsWith("test -e "));
+  const initIndex = lines.findIndex((l) => l.includes("git init"));
+  assert.ok(guardIndex !== -1, "a guard line exists");
+  assert.ok(guardIndex < initIndex, "the guard runs before git init");
+  assert.ok(lines[guardIndex].includes(shq(o.dir)), "the guarded path went through shq");
+  assert.ok(lines[guardIndex].includes("exit 1"), "the guard exits non-zero on a match");
+  assert.ok(!lines[guardIndex].includes("it's here"), "no unescaped single quote reaches the guard line");
 });
 
 test("importing the module does not start the interactive flow", async () => {

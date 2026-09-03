@@ -120,6 +120,17 @@ zone than the chosen offset may land one day off. This is a known and accepted
 limit, not a bug to fix later — the API does not carry the information needed to
 do better.
 
+Separately, the `since`/`until` fetch filter (see Fetch, step 4) keys off the
+commit's **committer** date, the same way `git log --since/--until` does, while
+this tool stores and replays `commit.author.date`. On rebased, cherry-picked, or
+imported history the two dates diverge, so the requested date range is only
+approximate for that history: a commit with a recent committer date but an old
+author date can be pulled in, and one authored in range whose committer date
+predates it can be dropped. Normal, non-rewritten history is unaffected since the
+two dates usually match. The query stays as-is — filtering client-side would mean
+fetching a much larger range to catch the same edge case, which costs more than
+the rare inaccuracy it would fix.
+
 ## Replay
 
 Refuse to proceed if the output directory already exists, rather than appending
