@@ -90,7 +90,7 @@ test("ghGet sleeps and retries once when the rate limit is exhausted", async () 
 test("ghGet does not retry a 403 that is not a rate limit", async () => {
   let n = 0;
   const f: Fetcher = async () => { n++; return jsonRes({ message: "forbidden" }, {}, 403); };
-  const res = await ghGet("https://api.github.com/user", "t", f, async () => {});
+  const res = await ghGet("https://api.github.com/user", "t", f, async () => { });
   assert.equal(n, 1);
   assert.equal(res.status, 403);
 });

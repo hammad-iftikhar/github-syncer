@@ -5,5 +5,8 @@
   "scripts": {
     "start": "node github-syncer.ts",
     "test": "node --test test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1"
   }
 }
