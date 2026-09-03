@@ -172,6 +172,9 @@ export function commitEnv(name: string, email: string, date: string): Record<str
   };
 }
 
+// ponytail: no resume. A replay that dies partway leaves a partial repo and the
+// only recovery is `rm -rf` and rerun; commits are empty so regenerating is cheap
+// and commits.json is already cached. Add resume if a real replay ever dies.
 export function replay(commits: Commit[], o: ReplayOpts): void {
   if (existsSync(o.dir)) throw new Error(`${o.dir} already exists — refusing to append to it`);
   execFileSync("git", ["init", "-q", "-b", "main", o.dir]);
@@ -202,6 +205,6 @@ export function renderScript(commits: Commit[], o: ReplayOpts): string {
       `  git -C ${shq(o.dir)} commit --allow-empty -q -m ${shq(`sync ${c.sha.slice(0, 7)}`)}`,
     );
   }
-  lines.push("", `echo 'created ${commits.length} commits in ${o.dir}'`, "");
+  lines.push("", `echo ${shq(`created ${commits.length} commits in ${o.dir}`)}`, "");
   return lines.join("\n");
 }

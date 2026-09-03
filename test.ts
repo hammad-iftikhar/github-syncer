@@ -284,3 +284,10 @@ test("the rendered script produces byte-identical history to a direct replay", (
     rmSync(base, { recursive: true, force: true });
   }
 });
+
+test("renderScript escapes a single quote in the output directory path everywhere it appears", () => {
+  const o: ReplayOpts = { dir: "/tmp/it's here", name: "Me", email: "me@example.com", offset: "+05:00" };
+  const script = renderScript(FIXTURE, o);
+  assert.ok(script.includes("it'\\''s"), "the quote in the path is escaped the way shq() escapes it");
+  assert.ok(!script.includes("it's here"), "no unescaped single quote reaches the script");
+});
