@@ -1,0 +1,9 @@
+{
+  "name": "github-syncer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node github-syncer.ts",
+    "test": "node --test test.ts"
+  }
+}
